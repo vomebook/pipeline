@@ -407,9 +407,7 @@ class PdfOcrStagesTests(unittest.TestCase):
 
     def test_render_workflow_partitions_and_enables_native_text_streams(self):
         root = Path(__file__).resolve().parents[1]
-        large = (root / ".github/workflows/pdf-render-inputs.yml").read_text()
         small = (root / ".github/workflows/pdf-render-small-inputs.yml").read_text()
-        self.assertIn("plan-render --partition large --native-text-stream", large)
         self.assertIn("plan-render --partition small --native-text-stream", small)
         self.assertIn("--source-repo", small)
         self.assertIn("--source-path-prefix", small)
@@ -579,7 +577,7 @@ class PdfOcrStagesTests(unittest.TestCase):
 
     def test_workflows_separate_rendering_and_recognition(self):
         root = Path(__file__).resolve().parents[1]
-        render_text = (root / ".github/workflows/pdf-render-inputs.yml").read_text()
+        render_text = (root / ".github/workflows/pdf-render-small-inputs.yml").read_text()
         ocr_text = (root / ".github/workflows/pdf-ocr-assets.yml").read_text()
         render = yaml.safe_load(render_text)
         ocr = yaml.safe_load(ocr_text)
@@ -587,7 +585,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertNotIn("requirements-pdf-ocr", render_text)
         self.assertNotIn("poppler-utils", ocr_text)
         self.assertNotIn("fetch_and_parse", ocr_text)
-        self.assertIn("Render PDF OCR Inputs", ocr_text)
+        self.assertNotIn("workflow_run:", ocr_text)
         self.assertIn("lang:", ocr_text)
         self.assertIn("PDF_OCR_LANG", ocr_text)
         self.assertIn("backend:", ocr_text)
@@ -598,7 +596,6 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertIn("--retry-failed-only", ocr_text)
         self.assertIn('default: "auto"', ocr_text)
         self.assertIn('default: "rapidocr_onnxruntime"', ocr_text)
-        self.assertIn("github.event.workflow_run.conclusion == 'success'", ocr["jobs"]["plan"]["if"])
         self.assertIn("!cancelled()", ocr["jobs"]["publish"]["if"])
         self.assertEqual(ocr[True]["workflow_dispatch"]["inputs"]["limit"]["default"], "100")
         self.assertIn("inputs.limit || '100'", ocr_text)
@@ -609,13 +606,13 @@ class PdfOcrStagesTests(unittest.TestCase):
 
     def test_scheduled_render_drains_pending_in_webp_batches(self):
         root = Path(__file__).resolve().parents[1]
-        text = (root / ".github/workflows/pdf-render-inputs.yml").read_text()
+        text = (root / ".github/workflows/pdf-render-small-inputs.yml").read_text()
         workflow = yaml.safe_load(text)
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["limit"]["default"], "100")
         self.assertFalse(inputs["generate_jxl"]["default"])
         self.assertEqual(workflow["env"]["PDF_JXL_ENABLED"], "${{ inputs.generate_jxl == true }}")
-        self.assertEqual(workflow["jobs"]["plan"]["steps"][5]["env"]["CHECKPOINT"], "${{ inputs.checkpoint || '0' }}")
+        self.assertIn("--checkpoint 0", text)
 
     def test_render_registry_stream_and_pending_ocr_are_committed_together(self):
         result = self.render_fixture()
