@@ -2,11 +2,13 @@
 
 This fork is reserved for rendering PDFs smaller than 100 MiB into Reader page
 streams. `anftm/pipeline` continues to own large-PDF rendering and OCR. The
-`Render Small PDF OCR Inputs` workflow is manual-only until the original small
-render schedule has been disabled in `anftm/pipeline`. Running both copies of
-that schedule would select the same pending books.
+`Render Small PDF OCR Inputs` runs every 15 minutes. The original small render
+workflow in `anftm/pipeline` must remain disabled; running both would select
+the same pending books.
 
-Before enabling this worker, configure `HF_TOKEN`, `PAGES_TOKEN`, and
-`PAGES_REPO` repository secrets, and coordinate publication of the shared
-Reader-Assets dataset and Pages sidecar with the original pipeline. Keep
-other jobs in the original repository. See `PDF_OCR.md` for asset contracts.
+This fork publishes its completed page streams to the shared Reader-Assets
+dataset. It then dispatches `anftm/pipeline`'s `Publish Reader Index` workflow,
+which serializes Pages sidecar publication with the original pipeline jobs.
+Configure `HF_TOKEN` and a `PIPELINE_TOKEN` with Actions write permission on
+`anftm/pipeline` as repository secrets. The original pipeline still owns OCR.
+See `PDF_OCR.md` for asset contracts.
