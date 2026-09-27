@@ -27,9 +27,6 @@ on:
         description: Re-probe and rebuild the selected source paths
         default: false
         type: boolean
-  schedule:
-    - cron: "*/15 * * * *"
-
 permissions:
   contents: read
   actions: read
@@ -163,21 +160,3 @@ jobs:
             --header "Content-Type: application/json" \
             --data '{"ref":"main"}' \
             "https://api.github.com/repos/anftm/pipeline/actions/workflows/publish-reader-index.yml/dispatches"
-      - name: Queue native text publication in main pipeline
-        if: needs.plan.outputs.shard_count != '0'
-        env:
-          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
-          SOURCE_REPO: ${{ inputs.source_repo || '' }}
-          SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
-        run: |
-          set -euo pipefail
-          test -n "${GH_TOKEN}"
-          payload=$(jq -nc --arg repo "$SOURCE_REPO" --arg prefix "$SOURCE_PATH_PREFIX" \
-            '{ref:"main",inputs:{limit:"100",source_repo:$repo,source_path_prefix:$prefix}}')
-          curl --fail-with-body --silent --show-error -X POST \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --header "Content-Type: application/json" \
-            --data "$payload" \
-            "https://api.github.com/repos/anftm/pipeline/actions/workflows/pdf-ocr-assets.yml/dispatches"
