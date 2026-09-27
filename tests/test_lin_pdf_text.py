@@ -1,5 +1,7 @@
 import gzip
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +16,12 @@ from tests.test_repair_gbk_pdf import fixture
 
 
 class LinPdfTextTests(unittest.TestCase):
+    def test_ocr_worker_import_does_not_require_mupdf(self):
+        result = subprocess.run([sys.executable, "-c",
+                                 'import sys; sys.modules["pymupdf"] = None; import scripts.pdf_ocr_stages'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_small_render_dispatches_text_publication_only_for_nonempty_batches(self):
         workflow = (Path(__file__).parents[1] / ".github/workflows/pdf-render-small-inputs.yml").read_text()
         self.assertIn("if: needs.plan.outputs.shard_count != '0'", workflow)
