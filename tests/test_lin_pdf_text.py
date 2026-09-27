@@ -14,6 +14,12 @@ from tests.test_repair_gbk_pdf import fixture
 
 
 class LinPdfTextTests(unittest.TestCase):
+    def test_small_render_dispatches_text_publication_only_for_nonempty_batches(self):
+        workflow = (Path(__file__).parents[1] / ".github/workflows/pdf-render-small-inputs.yml").read_text()
+        self.assertIn("if: needs.plan.outputs.shard_count != '0'", workflow)
+        self.assertIn("actions/workflows/pdf-ocr-assets.yml/dispatches", workflow)
+        self.assertIn("source_path_prefix:$prefix", workflow)
+
     def test_planner_marks_only_supported_native_text(self):
         item = {"key": reader_assets.asset_key("VoiceOfML/Teachers", reader_assets.GBK_PDF_FOLDER + "/合订本.pdf"),
                 "repo": "VoiceOfML/Teachers", "path": reader_assets.GBK_PDF_FOLDER + "/合订本.pdf",

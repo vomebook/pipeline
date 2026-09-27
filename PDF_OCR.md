@@ -69,7 +69,8 @@ the shared `reader-assets` publication lock.
   `reader-assets` publication lock, so a long tail shard cannot block small
   books from being rendered and published.
   The small-book schedule runs in this fork; after publishing it dispatches
-  `anftm/pipeline`'s `Publish Reader Index` workflow. Keep the original
+  `anftm/pipeline`'s `Publish Reader Index` workflow. Nonempty render batches
+  also queue the main pipeline's PDF text index/OCR publisher. Keep the original
   pipeline's retired small-book schedule disabled.
 - Native-text PDFs can join the page-stream queue without OCR: their extracted
   native text remains the search index and their raster pages are only for
