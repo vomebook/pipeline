@@ -219,6 +219,16 @@ class PdfOcrStagesTests(unittest.TestCase):
             retried = stages.plan_images({result["key"]: result}, {}, progress)
             self.assertEqual(retried["total_ocr_pages"], 1)
 
+    def test_failed_only_retry_discards_saved_pages_for_failed_book(self):
+        result = self.render_fixture()
+        progress = {result["key"]: {"generation": stages.generation_for(result),
+                                    "pages": {"1": {"p": 1}}}}
+        with patch.object(stages, "read_object", side_effect=self.read):
+            queue = stages.plan_images({result["key"]: result},
+                                       {result["key"]: {"status": "failed"}},
+                                       progress, retry_failed_only=True)
+        self.assertEqual(queue["total_ocr_pages"], 2)
+
     def test_prefetch_keeps_order_and_continues_after_download_error(self):
         result = self.render_fixture()
         with patch.object(stages, "read_object", side_effect=self.read):

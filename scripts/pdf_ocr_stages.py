@@ -79,7 +79,7 @@ def retry(operation):
         try:
             return operation()
         except HfHubHTTPError as exc:
-            if shared.hf_status_code(exc) not in {408, 429, 500, 502, 503, 504} or attempt == 7:
+            if shared.hf_status_code(exc) not in {408, 429, 499, 500, 502, 503, 504} or attempt == 7:
                 raise
             delay = _bucket_retry_delay(exc, attempt)
         except (httpx.TransportError, ConnectionError, OSError):
@@ -108,10 +108,12 @@ def read_object(meta: dict, suffix: str | None = None) -> bytes:
             follow_redirects=True, timeout=120)
         hf_raise_for_status(response)
         return response.content
-    data = retry(download)
-    if len(data) != meta["bytes"] or hashlib.sha256(data).hexdigest() != meta["sha256"]:
-        raise ValueError(f"object checksum mismatch: {path}")
-    return data
+    def download_verified():
+        data = download()
+        if len(data) != meta["bytes"] or hashlib.sha256(data).hexdigest() != meta["sha256"]:
+            raise ValueError(f"object checksum mismatch: {path}")
+        return data
+    return retry(download_verified)
 
 
 def page_meta(page: dict, field: str) -> dict:
@@ -612,8 +614,13 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         old = current.get(key, {})
         generation = generation_for(entry)
         previous = progress.get(key, {})
-        saved = previous.get("pages", {}) if previous.get("generation") == generation else reuse_recognized_pages(
-            old, entry, book["pages"])
+        if retry_failed_only and old.get("status") == "failed":
+            # Failed books may contain progress pointing at a corrupted object.
+            # Rebuild all OCR pages so assemble_book cannot reuse it again.
+            saved = {}
+        else:
+            saved = previous.get("pages", {}) if previous.get("generation") == generation else reuse_recognized_pages(
+                old, entry, book["pages"])
         book["saved"] = saved
         pending = [p for p in book["pages"] if p["source"] == "ocr" and str(p["p"]) not in saved]
         # Fast ONNX recognition benefits from fewer model startups. Keep the
