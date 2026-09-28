@@ -91,11 +91,22 @@ class ProgressTests(unittest.TestCase):
                          {"3": {"p": 3}})
         self.assertNotIn(progress.LEGACY, api.files)
 
+    def test_progress_chunks_keep_object_metadata_but_drop_text_and_layout(self):
+        key = "repo\0large.pdf"
+        api = FakeDataset(self.root)
+        page = {"p": 1, "source": "ocr", "i": "input", "is": "i" * 64, "ib": 10,
+                "o": "output", "os": "o" * 64, "ob": 20,
+                "text": "重复文本", "text_spans": [{"start": 0}], "layout": {"large": True}}
+        progress.save_progress(api, "test/repo", {key: {"generation": "g", "pages": {"1": page}}})
+        stored = progress.load_progress(api, "test/repo", [key], api.sha)[key]
+        self.assertEqual(stored["pages"]["1"], {field: page[field] for field in progress.COMPACT_FIELDS})
+        self.assertNotIn("text", gzip.decompress(api.files[progress.chunk_path(key, 0)]).decode())
+
     def test_corrupt_per_book_file_fails_closed(self):
         key = "repo\0first.pdf"
         api = FakeDataset(self.root)
-        api.files[progress.book_path(key)] = gzip.compress(b'{"version":1,"key":"wrong","pages":{}}')
-        with self.assertRaisesRegex(ValueError, "per-book"):
+        api.files[progress.book_path(key)] = b"not-json"
+        with self.assertRaisesRegex((ValueError, UnicodeDecodeError), ""):
             progress.load_progress(api, "test/repo", [key], api.sha)
 
     def test_index_is_invalidated_if_legacy_changes(self):

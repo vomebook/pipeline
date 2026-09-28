@@ -688,7 +688,8 @@ def collect_progress(queue, results):
                 raise ValueError("OCR result input mismatch")
             pdf_ocr.validate_ocr_object_path(page["o"], f"page-{page['p']:06d}.json.gz")
             key = str(page["p"])
-            if key in value["pages"] and value["pages"][key] != page:
+            if key in value["pages"] and any(value["pages"][key].get(field) != page.get(field)
+                                             for field in pdf_ocr_progress.COMPACT_FIELDS):
                 raise ValueError("conflicting OCR page results")
             value["pages"][key] = page
     return updates
@@ -698,8 +699,9 @@ def assemble_book(book, saved, bundle):
     base = {k: v for k, v in book.items() if k not in {"pages", "saved"}}
     if book["status"] == "skipped":
         return base
-    pages = [p if p["source"] == "native" else saved.get(str(p["p"])) for p in book["pages"]]
-    if any(p is None for p in pages):
+    pages = [p if p["source"] == "native" else
+             {**p, **saved.get(str(p["p"]), {})} for p in book["pages"]]
+    if any(p is None or (p["source"] == "ocr" and "o" not in p) for p in pages):
         return {**base, "status": "failed", "error": "OCR pages incomplete; uploaded pages retained for retry"}
     texts = []
     for page in pages:
