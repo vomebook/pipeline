@@ -6,7 +6,6 @@ import json
 import time
 from pathlib import Path
 
-import ijson
 from huggingface_hub import CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 
@@ -16,9 +15,6 @@ except ImportError:
     import shared
 
 
-LEGACY = "pdf_ocr_progress.json"
-LEGACY_KEYS = "pdf_ocr_progress_legacy_keys.json.gz"
-OLD_PREFIX = "pdf_ocr_progress_v2"
 PROGRESS_PREFIX = "pdf_ocr_progress_v3"
 PAGES_PER_CHUNK = 500
 COMPACT_FIELDS = ("p", "source", "i", "is", "ib", "o", "os", "ob")
@@ -39,11 +35,6 @@ def book_path(key):
 
 def chunk_path(key, start):
     return f"{book_dir(key)}/{start:08d}-{start + PAGES_PER_CHUNK - 1:08d}.json.gz"
-
-
-def old_book_path(key):
-    digest = _digest(key)
-    return f"{OLD_PREFIX}/{digest[:2]}/{digest}.json.gz"
 
 
 def _download(api, repo, name, revision):
@@ -91,93 +82,12 @@ def _load_v3(api, repo, key, revision):
 
 
 def load_book(api, repo, key, revision):
-    value = _load_v3(api, repo, key, revision)
-    if value is not None:
-        return value
-    path = _download(api, repo, old_book_path(key), revision)
-    if path is None:
-        return None
-    data = _load_json_gzip(path)
-    if (data.get("version") != 1 or data.get("key") != key
-            or not isinstance(data.get("generation"), str) or not isinstance(data.get("pages"), dict)):
-        raise ValueError("invalid legacy per-book OCR progress")
-    return {"generation": data["generation"], "pages": data["pages"]}
-
-
-def _legacy_sha(api, repo, revision):
-    files = api.get_paths_info(repo_id=repo, repo_type="dataset", revision=revision, paths=[LEGACY])
-    if not files:
-        return None
-    file = files[0]
-    sha = getattr(getattr(file, "lfs", None), "sha256", None) or getattr(file, "blob_id", None)
-    if not sha:
-        raise ValueError("OCR progress identity unavailable")
-    return sha
-
-
-def _load_key_index(api, repo, revision, sha):
-    path = _download(api, repo, LEGACY_KEYS, revision)
-    if path is None:
-        return None
-    with gzip.open(path, "rt", encoding="utf-8") as stream:
-        data = json.load(stream)
-    if (data.get("version") != 1 or not isinstance(data.get("keys"), list)
-            or any(not isinstance(key, str) for key in data["keys"])):
-        raise ValueError("invalid legacy OCR progress key index")
-    return set(data["keys"]) if data.get("legacy_sha256") == sha else None
-
-
-def _save_key_index(api, repo, sha, keys):
-    data = {"version": 1, "legacy_sha256": sha, "keys": sorted(keys)}
-    content = gzip.compress(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode(), mtime=0)
-    for attempt in range(10):
-        info = api.repo_info(repo_id=repo, repo_type="dataset")
-        if _legacy_sha(api, repo, info.sha) != sha:
-            return
-        try:
-            api.create_commit(repo_id=repo, repo_type="dataset", parent_commit=info.sha,
-                              commit_message="Index existing OCR progress keys",
-                              operations=[CommitOperationAdd(path_in_repo=LEGACY_KEYS, path_or_fileobj=content)])
-            return
-        except HfHubHTTPError as exc:
-            if not shared.is_retryable_hf_status(shared.hf_status_code(exc)) or attempt == 9:
-                raise
-            time.sleep(shared.hf_retry_delay(attempt))
+    return _load_v3(api, repo, key, revision)
 
 
 def load_progress(api, repo, keys, revision):
-    keys = set(keys)
-    selected = {}
-    for key in sorted(keys):
-        value = load_book(api, repo, key, revision)
-        if value is not None:
-            selected[key] = value
-    missing = keys - selected.keys()
-    if not missing:
-        return selected
-    sha = _legacy_sha(api, repo, revision)
-    if sha is None:
-        return selected
-    index = _load_key_index(api, repo, revision, sha)
-    if index is not None:
-        missing &= index
-        if not missing:
-            return selected
-    path = _download(api, repo, LEGACY, revision)
-    if path is None:
-        raise ValueError("OCR progress disappeared after path lookup")
-    found_keys = set()
-    with Path(path).open("rb") as stream:
-        for key, value in ijson.kvitems(stream, "files", use_float=True):
-            if index is None:
-                found_keys.add(key)
-            if key in missing:
-                if not isinstance(value, dict) or not isinstance(value.get("pages"), dict):
-                    raise ValueError("invalid legacy OCR book progress")
-                selected[key] = value
-    if index is None:
-        _save_key_index(api, repo, sha, found_keys)
-    return selected
+    return {key: value for key in sorted(set(keys))
+            if (value := load_book(api, repo, key, revision)) is not None}
 
 
 def _commit(api, repo, operations, message):

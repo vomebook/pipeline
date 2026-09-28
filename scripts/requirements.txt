@@ -2,7 +2,6 @@ bleach[css]==6.4.0
 tinycss2==1.5.1
 huggingface_hub==1.29.0
 hf-xet==1.5.2
-ijson==3.5.1
 jieba==0.42.1
 Pillow==12.3.0
 msoffcrypto-tool==6.0.0

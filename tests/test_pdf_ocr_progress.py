@@ -15,12 +15,9 @@ from scripts import pdf_ocr_progress as progress
 
 
 class FakeDataset:
-    def __init__(self, root, legacy=None):
+    def __init__(self, root):
         self.root = root
         self.files = {}
-        if legacy is not None:
-            self.files[progress.LEGACY] = (json.dumps({"version": 1, "files": legacy},
-                                                     ensure_ascii=False) + "\n").encode()
         self.downloads = []
         self.commits = []
         self.sha = "revision-0"
@@ -57,27 +54,11 @@ class ProgressTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def test_streams_legacy_once_and_indexes_all_keys_without_losing_other_books(self):
-        first = "repo\0first.pdf"
-        other = "repo\0other.pdf"
-        missing = "repo\0new.pdf"
-        old = {first: {"generation": "g", "pages": {"1": {"p": 1}}},
-               other: {"generation": "h", "pages": {str(n): {"p": n} for n in range(3000)}}}
-        api = FakeDataset(self.root, old)
-        selected = progress.load_progress(api, "test/repo", [first, missing], api.sha)
-        self.assertEqual(selected, {first: old[first]})
-        self.assertEqual(len(api.commits), 1)
-        indexed = json.loads(gzip.decompress(api.files[progress.LEGACY_KEYS]))
-        self.assertEqual(set(indexed["keys"]), {first, other})
-        api.downloads.clear()
-        self.assertEqual(progress.load_progress(api, "test/repo", [missing], api.sha), {})
-        self.assertNotIn(progress.LEGACY, api.downloads)
-
-        progress.save_progress(api, "test/repo", {first: {"generation": "g", "pages": {
-            **old[first]["pages"], "2": {"p": 2}}}})
-        stored = progress.load_progress(api, "test/repo", [first], api.sha)
-        self.assertEqual(stored[first]["pages"], {"1": {"p": 1}, "2": {"p": 2}})
-        self.assertEqual(json.loads(api.files[progress.LEGACY])["files"], old)
+    def test_missing_progress_is_empty_without_legacy_fallback(self):
+        key = "repo\0missing.pdf"
+        api = FakeDataset(self.root)
+        self.assertEqual(progress.load_progress(api, "test/repo", [key], api.sha), {})
+        self.assertEqual(api.downloads, [progress.book_path(key)])
 
     def test_per_book_progress_merges_same_generation_and_replaces_old_generation(self):
         key = "repo\0first.pdf"
@@ -89,7 +70,6 @@ class ProgressTests(unittest.TestCase):
         progress.save_progress(api, "test/repo", {key: {"generation": "new", "pages": {"3": {"p": 3}}}})
         self.assertEqual(progress.load_progress(api, "test/repo", [key], api.sha)[key]["pages"],
                          {"3": {"p": 3}})
-        self.assertNotIn(progress.LEGACY, api.files)
 
     def test_progress_chunks_keep_object_metadata_but_drop_text_and_layout(self):
         key = "repo\0large.pdf"
@@ -108,17 +88,6 @@ class ProgressTests(unittest.TestCase):
         api.files[progress.book_path(key)] = b"not-json"
         with self.assertRaisesRegex((ValueError, UnicodeDecodeError), ""):
             progress.load_progress(api, "test/repo", [key], api.sha)
-
-    def test_index_is_invalidated_if_legacy_changes(self):
-        first = "repo\0first.pdf"
-        api = FakeDataset(self.root, {first: {"generation": "g", "pages": {}}})
-        progress.load_progress(api, "test/repo", [first], api.sha)
-        second = "repo\0second.pdf"
-        api.files[progress.LEGACY] = json.dumps({"version": 1, "files": {
-            first: {"generation": "g", "pages": {}}, second: {"generation": "h", "pages": {}}}}).encode()
-        api.downloads.clear()
-        self.assertIn(second, progress.load_progress(api, "test/repo", [second], api.sha))
-        self.assertIn(progress.LEGACY, api.downloads)
 
     def test_plan_only_requests_selected_books_progress(self):
         from scripts import pdf_ocr_stages as stages
