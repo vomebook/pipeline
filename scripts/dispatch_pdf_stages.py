@@ -58,7 +58,7 @@ def completed_with_work(repo, run_id, headers):
 
 
 def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
-             render_band="under32", ocr_lane_index=0):
+             render_band="under32", ocr_lane_index=0, upstream_token=""):
     if not repo or not token or worker not in WORKFLOWS:
         raise ValueError("REPO, GH_TOKEN and a valid worker are required")
     if worker == "small" and render_band not in {"under32", "32to100"}:
@@ -79,7 +79,10 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
     targets = (repo, "anftm/pipeline") if worker == "ocr" else (repo,)
     for target in targets:
         target_endpoint = f"https://api.github.com/repos/{target}/actions/workflows/{workflow}"
-        if is_active(target_endpoint, headers):
+        target_headers = headers
+        if target != repo and upstream_token:
+            target_headers = {**headers, "Authorization": f"Bearer {upstream_token}"}
+        if is_active(target_endpoint, target_headers):
             print(f"PDF {worker} worker already pending or active in {target}; skipping dispatch.")
             return False
 
@@ -110,4 +113,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     dispatch(os.environ.get("REPO"), os.environ.get("GH_TOKEN"), args.worker,
              os.environ.get("COMPLETED_RUN_ID", ""), os.environ.get("COMPLETED_CONCLUSION", ""),
-             args.render_band, args.lane_index)
+             args.render_band, args.lane_index, os.environ.get("UPSTREAM_GH_TOKEN", ""))

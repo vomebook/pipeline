@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: schedule-pdf-ocr
@@ -25,9 +26,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Dispatch OCR worker only when idle
         env:
-          GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           COMPLETED_RUN_ID: ${{ github.event.workflow_run.id || '' }}
           COMPLETED_CONCLUSION: ${{ github.event.workflow_run.conclusion || '' }}
           OCR_LANE_INDEX: ${{ vars.PDF_OCR_LANE_INDEX || '0' }}
+          UPSTREAM_GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
         run: python3 scripts/dispatch_pdf_stages.py ocr --lane-index "$OCR_LANE_INDEX"

@@ -106,6 +106,18 @@ class DispatchPdfStagesTests(unittest.TestCase):
         self.assertEqual(api.posts, [(REPO, "pdf-ocr-assets.yml/dispatches",
                                      {"ref": "main", "inputs": {"lane_index": "0"}})])
 
+    def test_ocr_uses_separate_upstream_token_for_anftm_status(self):
+        api = FakeGitHub()
+        seen = []
+        def respond(request, timeout):
+            if request.full_url.startswith("https://api.github.com/repos/anftm/"):
+                seen.append(request.get_header("Authorization"))
+            return api.open(request, timeout)
+        with patch.object(controller, "urlopen", side_effect=respond):
+            self.assertTrue(controller.dispatch(REPO, "repo-token", "ocr", upstream_token="upstream-token"))
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"Bearer upstream-token"})
+
     def test_dispatch_carries_selected_render_band_and_ocr_lane(self):
         api = FakeGitHub()
         with patch.object(controller, "urlopen", side_effect=api.open):
@@ -165,6 +177,8 @@ class DispatchPdfStagesTests(unittest.TestCase):
                 self.assertIn("head_branch == 'main'", workflow["jobs"]["dispatch"]["if"])
                 self.assertIn("COMPLETED_RUN_ID", workflow["jobs"]["dispatch"]["steps"][-1]["env"])
                 env = workflow["jobs"]["dispatch"]["steps"][-1]["env"]
+                self.assertEqual(env["GH_TOKEN"], "${{ github.token }}")
+                self.assertIn("UPSTREAM_GH_TOKEN", env)
                 if worker == "small":
                     self.assertIn("vars.PDF_RENDER_BAND", env["RENDER_BAND"])
                 else:
