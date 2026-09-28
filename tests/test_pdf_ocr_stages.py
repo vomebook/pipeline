@@ -475,6 +475,32 @@ class PdfOcrStagesTests(unittest.TestCase):
                  "reader_assets_path": "objects/aa/" + "a" * 64 + "/gbk-font-repair-v1/document.pdf"}
         self.assertTrue(stages.skip_ocr_for_generated_text_pdf(entry))
         self.assertFalse(stages.skip_ocr_for_generated_text_pdf({"source_kind": "upstream"}))
+        for key in stages.VERIFIED_SCAN_GBK_PDFS:
+            with self.subTest(key=key):
+                scanned = {**entry, "key": key, "classification": "scan", "ocr_pages": 2}
+                self.assertFalse(stages.skip_ocr_for_generated_text_pdf(scanned))
+                self.assertFalse(stages.skip_ocr_for_generated_text_pdf({**scanned, "classification": "mixed"}))
+                self.assertTrue(stages.skip_ocr_for_generated_text_pdf({**scanned, "ocr_pages": 0}))
+                self.assertTrue(stages.skip_ocr_for_generated_text_pdf({**scanned, "classification": "native-text"}))
+                self.assertFalse(stages.skip_ocr_for_generated_text_pdf(
+                    {**scanned, "reader_assets_path": "ordinary.pdf"}))
+        self.assertTrue(stages.skip_ocr_for_generated_text_pdf({**entry, "key":
+            "VoiceOfML/Teachers\0A4 毛泽东主席/03-03 建国以来毛泽东文稿 林一章版/合订本.pdf",
+            "classification": "scan", "ocr_pages": 7302}))
+
+    def test_verified_gbk_scans_enter_ocr_queue_without_unprotecting_other_repairs(self):
+        fixture = self.render_fixture()
+        key = sorted(stages.VERIFIED_SCAN_GBK_PDFS)[0]
+        repaired = {**fixture, "key": key, "source_kind": "generated", "ocr_pages": 2,
+                    "reader_assets_path": "objects/aa/" + "a" * 64 + "/gbk-font-repair-v1/document.pdf"}
+        protected = {**repaired, "key":
+                     "VoiceOfML/Teachers\0A4 毛泽东主席/03-03 建国以来毛泽东文稿 林一章版/合订本.pdf"}
+        with patch.object(stages, "read_object", side_effect=self.read), \
+                patch.object(stages, "validate_render", return_value={"pages": [
+                    {"p": 1, "source": "ocr"}, {"p": 2, "source": "ocr"}]}):
+            queue = stages.plan_images({key: repaired, protected["key"]: protected}, {}, {})
+        self.assertEqual([book["key"] for book in queue["books"]], [key])
+        self.assertEqual(queue["total_ocr_pages"], 2)
 
     def test_failed_books_do_not_starve_untouched_backlog(self):
         failed = {**self.item(), "key": "repo\0a.pdf", "path": "a.pdf"}

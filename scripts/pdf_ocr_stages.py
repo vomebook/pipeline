@@ -40,6 +40,13 @@ RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
 BUCKET = "hf://buckets/vomebook/pdf-pages"
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
+VERIFIED_SCAN_GBK_PDFS = frozenset(
+    "VoiceOfML/Teachers\0A1 马克思&恩格斯/01-04 马克思恩格斯全集 林一章新版/" + name + ".pdf"
+    for name in (
+        "专题分类索引（1-39）", "人名索引（1-39）", "名目索引（1-39）",
+        "注释选编（1-39）", "目录、说明、索引（40-50）", "说明汇编（1-39）",
+    )
+)
 
 
 def render_profile() -> str:
@@ -466,15 +473,16 @@ def recognition_identity(entry, options):
 
 
 def skip_ocr_for_generated_text_pdf(entry: dict) -> bool:
-    """Do not OCR repaired PDFs merely because a runner cannot decode them.
+    """Protect repaired native text, except the six verified scanned indexes.
 
-    The GBK-repaired source has a usable text layer on supported Poppler/PDF
-    environments. Its page stream is still useful for fast Reader startup,
-    but treating a runner-specific empty extraction as a scan would OCR every
-    page and replace the source text with recognition output.
+    Most GBK-repaired sources have usable text even when a runner reports a
+    scan. The six listed Teachers indexes have no substantive native text.
     """
     return (entry.get("source_kind") == "generated"
             and "/gbk-font-repair-v1/" in str(entry.get("reader_assets_path", ""))
+            and not (entry.get("key") in VERIFIED_SCAN_GBK_PDFS
+                     and entry.get("classification") in {"scan", "mixed"}
+                     and isinstance(entry.get("ocr_pages"), int) and entry["ocr_pages"] > 0)
             and not (entry.get("native_extractor") == "pymupdf-v1"
                      and entry.get("classification") in {"native-text", "mixed"}))
 

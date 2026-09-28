@@ -100,9 +100,10 @@ publish checksummed per-page native text, complete v2 book index and OCR
 manifest while retaining the existing page-manifest/images. Run one book at
 a time under the Reader-Assets publication lock; check Reader text selection
 and exact book search after publishing. The command refuses source digest or
-page-count drift and incomplete native-text coverage. Already rendered GBK
-streams classified as scans are excluded from the automatic image-OCR plan
-pending this text recovery.
+page-count drift and incomplete native-text coverage. Repaired PDFs with usable
+native text stay out of image OCR. Six verified scanned indexes/appendices in
+the `马克思恩格斯全集 林一章新版` folder are explicitly eligible for OCR from
+their existing PNG inputs; other repaired books retain the exclusion.
 
 ## Recognition
 
