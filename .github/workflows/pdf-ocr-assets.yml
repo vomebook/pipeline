@@ -8,7 +8,7 @@ on:
         default: "100"
         type: string
       lane_index:
-        description: Stable OCR lane index (0-2)
+        description: Stable OCR lane index (0-1)
         default: "0"
         type: string
       target_pages:
@@ -77,7 +77,7 @@ jobs:
           SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
         run: |
           [[ "$LIMIT" =~ ^[0-9]+$ ]] && ((10#$LIMIT >= 1 && 10#$LIMIT <= 100)) || exit 1
-          [[ "$OCR_LANE_INDEX" =~ ^[0-2]$ ]] || exit 1
+          [[ "$OCR_LANE_INDEX" =~ ^[0-1]$ ]] || exit 1
           [[ "$PDF_OCR_TARGET_PAGES_PER_SHARD" =~ ^[0-9]+$ ]] && ((10#$PDF_OCR_TARGET_PAGES_PER_SHARD >= 1 && 10#$PDF_OCR_TARGET_PAGES_PER_SHARD <= 5000)) || exit 1
           args=()
           if [[ "$RETRY_FAILED_ONLY" == true ]]; then args+=(--retry-failed-only); fi

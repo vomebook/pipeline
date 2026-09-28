@@ -124,15 +124,15 @@ class DispatchPdfStagesTests(unittest.TestCase):
             self.assertTrue(controller.dispatch(REPO, "token", "small", render_band="32to100"))
         api.runs[REPO].clear()
         with patch.object(controller, "urlopen", side_effect=api.open):
-            self.assertTrue(controller.dispatch(REPO, "token", "ocr", ocr_lane_index=2))
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr", ocr_lane_index=1))
         self.assertEqual(api.posts[0][2]["inputs"], {"render_band": "32to100"})
-        self.assertEqual(api.posts[1][2]["inputs"], {"lane_index": "2"})
+        self.assertEqual(api.posts[1][2]["inputs"], {"lane_index": "1"})
 
     def test_invalid_render_band_or_ocr_lane_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "render band"):
             controller.dispatch(REPO, "token", "small", render_band="large")
         with self.assertRaisesRegex(ValueError, "lane index"):
-            controller.dispatch(REPO, "token", "ocr", ocr_lane_index=3)
+            controller.dispatch(REPO, "token", "ocr", ocr_lane_index=2)
 
     def test_api_error_and_malformed_response_fail_closed(self):
         api = FakeGitHub()

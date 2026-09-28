@@ -63,8 +63,8 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
         raise ValueError("REPO, GH_TOKEN and a valid worker are required")
     if worker == "small" and render_band not in {"under32", "32to100"}:
         raise ValueError("invalid small PDF render band")
-    if worker == "ocr" and (type(ocr_lane_index) is not int or not 0 <= ocr_lane_index < 3):
-        raise ValueError("OCR lane index must be between 0 and 2")
+    if worker == "ocr" and (type(ocr_lane_index) is not int or not 0 <= ocr_lane_index < 2):
+        raise ValueError("OCR lane index must be between 0 and 1")
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
     if completed_run_id:

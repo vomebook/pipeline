@@ -41,7 +41,7 @@ RENDER_RANGE_THRESHOLD = 500
 BUCKET = "hf://buckets/vomebook/pdf-pages"
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
 TINY_RENDER_MAX_SOURCE_BYTES = 32 * 1024 * 1024
-OCR_LANE_COUNT = 3
+OCR_LANE_COUNT = 2
 VERIFIED_SCAN_GBK_PDFS = frozenset(
     "VoiceOfML/Teachers\0A1 马克思&恩格斯/01-04 马克思恩格斯全集 林一章新版/" + name + ".pdf"
     for name in (

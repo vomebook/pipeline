@@ -473,7 +473,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         lanes = [{key for key, lane in assignments.items() if lane == index}
                  for index in range(stages.OCR_LANE_COUNT)]
         self.assertEqual(set.union(*lanes), set(keys))
-        self.assertFalse(lanes[0] & lanes[1] or lanes[0] & lanes[2] or lanes[1] & lanes[2])
+        self.assertFalse(lanes[0] & lanes[1])
 
     def test_render_workflow_partitions_and_enables_native_text_streams(self):
         root = Path(__file__).resolve().parents[1]
