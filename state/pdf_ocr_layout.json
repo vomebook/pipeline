@@ -1,1 +1,12 @@
-{}
+{
+  "VoiceOfML/A-Historical-Learning-Data\u0000\u65e0\u4ea7\u9636\u7ea7\u9769\u547d\u6218\u7565\u2014\u2014\u6301\u4e45\u4eba\u6c11\u6218\u4e89/La Guerre Populaire dans les pays impérialistes.pdf": {
+    "default": {
+      "writing_mode": "horizontal-ltr"
+    }
+  },
+  "VoiceOfML/Japanese-Materials\u0000XXX\u306e\u6226\u5f8c\u516b\u5341\u5e74\u3000\u300c\u5927\u8846\u7684\u524d\u885b\u515a\u300d\u306e\u77db\u76fe\u3092\u554f\u3046.pdf": {
+    "default": {
+      "writing_mode": "vertical-rl"
+    }
+  }
+}
