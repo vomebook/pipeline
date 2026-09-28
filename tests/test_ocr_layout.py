@@ -55,6 +55,12 @@ class OcrLayoutTests(unittest.TestCase):
         self.assertEqual(result["layout"]["writing_mode"], "horizontal-ltr")
         self.assertIn("reading-direction-assumed-ltr", result["layout"]["review"])
 
+    def test_narrow_horizontal_fragments_do_not_infer_vertical_reading(self):
+        blocks = [block("第一", [.1, .1, .15, .14]), block("第二", [.2, .1, .25, .14]),
+                  block("第三", [.3, .1, .35, .14])]
+        result = layout.arrange(blocks, 1000, 1000)
+        self.assertEqual(result["layout"]["writing_mode"], "horizontal-ltr")
+
     def test_two_columns_do_not_interleave_rows(self):
         blocks = [block("左栏第一行", [.1, .1, .4, .14]), block("右栏第一行", [.6, .1, .9, .14]),
                   block("左栏第二行", [.1, .16, .4, .2]), block("右栏第二行", [.6, .16, .9, .2])]

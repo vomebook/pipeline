@@ -11,7 +11,7 @@ import copy
 import re
 import statistics
 
-VERSION = "layout-v1"
+VERSION = "layout-v2"
 MODES = {"auto", "horizontal-ltr", "horizontal-rtl", "vertical-rl", "vertical-lr"}
 
 
@@ -59,8 +59,20 @@ def physical_ratio(block, width, height):
 def infer_mode(blocks, width, height):
     substantial = [b for b in blocks
                    if len(b["t"].strip()) >= 3 and b["b"][2] > b["b"][0] and b["b"][3] > b["b"][1]]
-    if substantial and sum(physical_ratio(b, width, height) < .6 for b in substantial) / len(substantial) >= .75:
-        return "vertical-rl", "geometry"
+    candidates = [b for b in substantial
+                  if physical_ratio(b, width, height) < .6
+                  and b["b"][3] - b["b"][1] >= .12
+                  and b["b"][2] - b["b"][0] <= .25]
+    # A narrow block is not enough evidence: horizontal OCR can fragment words
+    # into narrow boxes. Require two tall columns with meaningful vertical
+    # overlap before inferring traditional right-to-left reading order.
+    for left in candidates:
+        for right in candidates:
+            if right is left or abs(right["b"][0] - left["b"][0]) < .15:
+                continue
+            overlap = min(left["b"][3], right["b"][3]) - max(left["b"][1], right["b"][1])
+            if overlap >= .12:
+                return "vertical-rl", "geometry"
     return "horizontal-ltr", "default"
 
 
