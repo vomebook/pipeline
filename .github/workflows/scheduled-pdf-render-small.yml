@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   dispatch:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main'
+    if: vars.PDF_RENDER_ENABLED != 'false' && (github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -29,4 +29,5 @@ jobs:
           REPO: ${{ github.repository }}
           COMPLETED_RUN_ID: ${{ github.event.workflow_run.id || '' }}
           COMPLETED_CONCLUSION: ${{ github.event.workflow_run.conclusion || '' }}
-        run: python3 scripts/dispatch_pdf_stages.py small
+          RENDER_BAND: ${{ vars.PDF_RENDER_BAND || 'under32' }}
+        run: python3 scripts/dispatch_pdf_stages.py small --render-band "$RENDER_BAND"

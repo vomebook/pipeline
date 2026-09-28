@@ -7,6 +7,10 @@ on:
         description: Maximum rendered books to process
         default: "100"
         type: string
+      lane_index:
+        description: Stable OCR lane index (0-2)
+        default: "0"
+        type: string
       target_pages:
         description: Target actual OCR pages per worker
         default: "2000"
@@ -41,7 +45,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: pdf-image-ocr-assets
+  group: ${{ format('pdf-image-ocr-assets-{0}', inputs.lane_index || '0') }}
   cancel-in-progress: false
   queue: max
 
@@ -64,6 +68,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           LIMIT: ${{ inputs.limit || '100' }}
+          OCR_LANE_INDEX: ${{ inputs.lane_index || '0' }}
           PDF_OCR_TARGET_PAGES_PER_SHARD: ${{ inputs.target_pages || '2000' }}
           PDF_OCR_LANG: ${{ inputs.lang || 'auto' }}
           PDF_OCR_BACKEND: ${{ inputs.backend || 'rapidocr_onnxruntime' }}
@@ -72,10 +77,11 @@ jobs:
           SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
         run: |
           [[ "$LIMIT" =~ ^[0-9]+$ ]] && ((10#$LIMIT >= 1 && 10#$LIMIT <= 100)) || exit 1
+          [[ "$OCR_LANE_INDEX" =~ ^[0-2]$ ]] || exit 1
           [[ "$PDF_OCR_TARGET_PAGES_PER_SHARD" =~ ^[0-9]+$ ]] && ((10#$PDF_OCR_TARGET_PAGES_PER_SHARD >= 1 && 10#$PDF_OCR_TARGET_PAGES_PER_SHARD <= 5000)) || exit 1
           args=()
           if [[ "$RETRY_FAILED_ONLY" == true ]]; then args+=(--retry-failed-only); fi
-          python scripts/pdf_ocr_stages.py plan-ocr --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX" --limit "$LIMIT" "${args[@]}"
+          python scripts/pdf_ocr_stages.py plan-ocr --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX" --limit "$LIMIT" --ocr-lane-index "$OCR_LANE_INDEX" "${args[@]}"
           echo "shard_count=$(jq -r '.shard_count' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
           echo "shard_ids=$(jq -c '.shard_ids' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7

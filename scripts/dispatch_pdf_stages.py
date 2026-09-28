@@ -57,9 +57,14 @@ def completed_with_work(repo, run_id, headers):
         page += 1
 
 
-def dispatch(repo, token, worker, completed_run_id="", completed_conclusion=""):
+def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
+             render_band="under32", ocr_lane_index=0):
     if not repo or not token or worker not in WORKFLOWS:
         raise ValueError("REPO, GH_TOKEN and a valid worker are required")
+    if worker == "small" and render_band not in {"under32", "32to100"}:
+        raise ValueError("invalid small PDF render band")
+    if worker == "ocr" and (type(ocr_lane_index) is not int or not 0 <= ocr_lane_index < 3):
+        raise ValueError("OCR lane index must be between 0 and 2")
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
     if completed_run_id:
@@ -78,7 +83,10 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion=""):
             print(f"PDF {worker} worker already pending or active in {target}; skipping dispatch.")
             return False
 
-    request = Request(endpoint + "/dispatches", data=b'{"ref":"main"}',
+    inputs = ({"render_band": render_band} if worker == "small"
+              else {"lane_index": str(ocr_lane_index)})
+    body = json.dumps({"ref": "main", "inputs": inputs}).encode()
+    request = Request(endpoint + "/dispatches", data=body,
                       headers={**headers, "Content-Type": "application/json"}, method="POST")
     with urlopen(request, timeout=30) as response:
         if response.status not in (200, 204):
@@ -97,6 +105,9 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion=""):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("worker", choices=WORKFLOWS)
+    parser.add_argument("--render-band", choices=("under32", "32to100"), default="under32")
+    parser.add_argument("--lane-index", type=int, default=0)
     args = parser.parse_args()
     dispatch(os.environ.get("REPO"), os.environ.get("GH_TOKEN"), args.worker,
-             os.environ.get("COMPLETED_RUN_ID", ""), os.environ.get("COMPLETED_CONCLUSION", ""))
+             os.environ.get("COMPLETED_RUN_ID", ""), os.environ.get("COMPLETED_CONCLUSION", ""),
+             args.render_band, args.lane_index)

@@ -447,27 +447,55 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertEqual(stages.pending_render([item], {}, {item["key"]: {**old, "ocr_manifest": ""}}), [item])
 
     def test_render_partitions_keep_small_and_large_files_independent(self):
-        small = {**self.item(), "source_bytes": stages.SMALL_RENDER_MAX_SOURCE_BYTES - 1}
-        large = {**self.item(), "key": "repo\0large.pdf", "path": "large.pdf",
-                 "source_bytes": stages.SMALL_RENDER_MAX_SOURCE_BYTES}
-        self.assertTrue(stages.render_partition_matches(small, "small"))
-        self.assertFalse(stages.render_partition_matches(small, "large"))
-        self.assertFalse(stages.render_partition_matches(large, "small"))
-        self.assertTrue(stages.render_partition_matches(large, "large"))
-        self.assertTrue(stages.render_partition_matches(small, "all"))
+        below_32 = {**self.item(), "source_bytes": stages.TINY_RENDER_MAX_SOURCE_BYTES - 1}
+        at_32 = {**self.item(), "key": "repo\0medium.pdf", "path": "medium.pdf",
+                 "source_bytes": stages.TINY_RENDER_MAX_SOURCE_BYTES}
+        below_100 = {**self.item(), "key": "repo\0large.pdf", "path": "large.pdf",
+                     "source_bytes": stages.SMALL_RENDER_MAX_SOURCE_BYTES - 1}
+        at_100 = {**self.item(), "key": "repo\0huge.pdf", "path": "huge.pdf",
+                  "source_bytes": stages.SMALL_RENDER_MAX_SOURCE_BYTES}
+        for item in (below_32,):
+            self.assertTrue(stages.render_partition_matches(item, "under32"))
+            self.assertFalse(stages.render_partition_matches(item, "32to100"))
+        for item in (at_32, below_100):
+            self.assertFalse(stages.render_partition_matches(item, "under32"))
+            self.assertTrue(stages.render_partition_matches(item, "32to100"))
+        self.assertFalse(stages.render_partition_matches(at_100, "under32"))
+        self.assertFalse(stages.render_partition_matches(at_100, "32to100"))
+        self.assertTrue(stages.render_partition_matches(at_100, "large"))
+        self.assertTrue(stages.render_partition_matches(below_32, "all"))
+
+    def test_ocr_lanes_are_stable_and_disjoint(self):
+        keys = [f"repo\\0book-{index}.pdf" for index in range(300)]
+        assignments = {key: stages.ocr_lane_index(key) for key in keys}
+        self.assertEqual(assignments, {key: stages.ocr_lane_index(key) for key in keys})
+        self.assertEqual(set(assignments.values()), set(range(stages.OCR_LANE_COUNT)))
+        lanes = [{key for key, lane in assignments.items() if lane == index}
+                 for index in range(stages.OCR_LANE_COUNT)]
+        self.assertEqual(set.union(*lanes), set(keys))
+        self.assertFalse(lanes[0] & lanes[1] or lanes[0] & lanes[2] or lanes[1] & lanes[2])
 
     def test_render_workflow_partitions_and_enables_native_text_streams(self):
         root = Path(__file__).resolve().parents[1]
         small = (root / ".github/workflows/pdf-render-small-inputs.yml").read_text()
-        self.assertIn("plan-render --partition small --native-text-stream", small)
+        self.assertIn('plan-render --partition "$RENDER_BAND" --native-text-stream', small)
         self.assertIn("--source-repo", small)
         self.assertIn("--source-path-prefix", small)
         self.assertIn("fonts-noto-cjk", small)
         ocr = (root / ".github/workflows/pdf-ocr-assets.yml").read_text()
         self.assertIn("--source-repo", ocr)
         self.assertIn("--source-path-prefix", ocr)
-        self.assertIn("group: pdf-render-small-inputs", small)
+        self.assertIn("group: ${{ format('pdf-render-small-inputs-{0}', inputs.render_band || 'under32') }}", small)
         self.assertIn("group: reader-assets", small)
+        self.assertIn("32to100", small)
+        self.assertIn("under32", small)
+        self.assertIn("--ocr-lane-index", ocr)
+        small_workflow = yaml.safe_load(small)
+        self.assertEqual(small_workflow[True]["workflow_dispatch"]["inputs"]["render_band"]["default"], "under32")
+        self.assertEqual(small_workflow["jobs"]["build"]["strategy"]["max-parallel"], 10)
+        ocr_workflow = yaml.safe_load(ocr)
+        self.assertEqual(ocr_workflow[True]["workflow_dispatch"]["inputs"]["lane_index"]["default"], "0")
+        self.assertEqual(ocr_workflow["jobs"]["build"]["strategy"]["max-parallel"], 10)
 
     def test_native_text_stream_plan_marks_pages_for_images_without_ocr(self):
         item = {**self.item(), "source_bytes": 1024}

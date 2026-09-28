@@ -35,7 +35,7 @@ class FakeGitHub:
         self_path = request.full_url.split("/actions/workflows/")
         repo = self_path[0].split("/repos/", 1)[1]
         if request.get_method() == "POST":
-            self.posts.append((repo, self_path[1]))
+            self.posts.append((repo, self_path[1], json.loads(request.data)))
             self.runs[repo].insert(0, {"id": 123, "status": "queued"})
             return Response(status=204)
         if self_path[1].endswith("/runs?per_page=100"):
@@ -61,6 +61,7 @@ class DispatchPdfStagesTests(unittest.TestCase):
             self.assertTrue(controller.dispatch(REPO, "token", "small", "100", "success"))
             self.assertFalse(controller.dispatch(REPO, "token", "small"))
         self.assertEqual(len(api.posts), 1)
+        self.assertEqual(api.posts[0][2], {"ref": "main", "inputs": {"render_band": "under32"}})
         self.assertEqual(sleep.call_count, 2)
 
     def test_empty_or_failed_worker_does_not_trigger_another_immediate_run(self):
@@ -102,7 +103,24 @@ class DispatchPdfStagesTests(unittest.TestCase):
             self.assertFalse(controller.dispatch(REPO, "token", "ocr"))
             api.runs[REPO][0]["status"] = "completed"
             self.assertTrue(controller.dispatch(REPO, "token", "ocr"))
-        self.assertEqual(api.posts, [(REPO, "pdf-ocr-assets.yml/dispatches")])
+        self.assertEqual(api.posts, [(REPO, "pdf-ocr-assets.yml/dispatches",
+                                     {"ref": "main", "inputs": {"lane_index": "0"}})])
+
+    def test_dispatch_carries_selected_render_band_and_ocr_lane(self):
+        api = FakeGitHub()
+        with patch.object(controller, "urlopen", side_effect=api.open):
+            self.assertTrue(controller.dispatch(REPO, "token", "small", render_band="32to100"))
+        api.runs[REPO].clear()
+        with patch.object(controller, "urlopen", side_effect=api.open):
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr", ocr_lane_index=2))
+        self.assertEqual(api.posts[0][2]["inputs"], {"render_band": "32to100"})
+        self.assertEqual(api.posts[1][2]["inputs"], {"lane_index": "2"})
+
+    def test_invalid_render_band_or_ocr_lane_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "render band"):
+            controller.dispatch(REPO, "token", "small", render_band="large")
+        with self.assertRaisesRegex(ValueError, "lane index"):
+            controller.dispatch(REPO, "token", "ocr", ocr_lane_index=3)
 
     def test_api_error_and_malformed_response_fail_closed(self):
         api = FakeGitHub()
@@ -146,6 +164,11 @@ class DispatchPdfStagesTests(unittest.TestCase):
                 self.assertIn(f"dispatch_pdf_stages.py {worker}", workflow["jobs"]["dispatch"]["steps"][-1]["run"])
                 self.assertIn("head_branch == 'main'", workflow["jobs"]["dispatch"]["if"])
                 self.assertIn("COMPLETED_RUN_ID", workflow["jobs"]["dispatch"]["steps"][-1]["env"])
+                env = workflow["jobs"]["dispatch"]["steps"][-1]["env"]
+                if worker == "small":
+                    self.assertIn("vars.PDF_RENDER_BAND", env["RENDER_BAND"])
+                else:
+                    self.assertIn("vars.PDF_OCR_LANE_INDEX", env["OCR_LANE_INDEX"])
 
 
 if __name__ == "__main__":

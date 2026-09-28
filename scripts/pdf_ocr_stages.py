@@ -40,6 +40,8 @@ RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
 BUCKET = "hf://buckets/vomebook/pdf-pages"
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
+TINY_RENDER_MAX_SOURCE_BYTES = 32 * 1024 * 1024
+OCR_LANE_COUNT = 3
 VERIFIED_SCAN_GBK_PDFS = frozenset(
     "VoiceOfML/Teachers\0A1 马克思&恩格斯/01-04 马克思恩格斯全集 林一章新版/" + name + ".pdf"
     for name in (
@@ -198,9 +200,21 @@ def render_partition_matches(item, partition):
         return True
     size = int(item.get("source_bytes") or 0)
     if not size:
-        return partition == "small"
-    is_small = size < SMALL_RENDER_MAX_SOURCE_BYTES
-    return is_small if partition == "small" else not is_small
+        return partition in {"small", "under32"}
+    if partition == "under32":
+        return size < TINY_RENDER_MAX_SOURCE_BYTES
+    if partition == "32to100":
+        return TINY_RENDER_MAX_SOURCE_BYTES <= size < SMALL_RENDER_MAX_SOURCE_BYTES
+    if partition == "small":
+        return size < SMALL_RENDER_MAX_SOURCE_BYTES
+    return size >= SMALL_RENDER_MAX_SOURCE_BYTES
+
+
+def ocr_lane_index(key, lane_count=OCR_LANE_COUNT):
+    if type(lane_count) is not int or lane_count < 1:
+        raise ValueError("OCR lane count must be a positive integer")
+    digest = hashlib.sha256(str(key).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % lane_count
 
 
 def pending_render(records, rendered, ocr, retry_failed=False, partition="all", force_reprobe=False):
@@ -799,7 +813,9 @@ def main():
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--checkpoint", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true")
-    parser.add_argument("--partition", choices=("all", "small", "large"), default="all")
+    parser.add_argument("--partition", choices=("all", "small", "under32", "32to100", "large"), default="all")
+    parser.add_argument("--ocr-lane-index", type=int)
+    parser.add_argument("--ocr-lane-count", type=int, default=OCR_LANE_COUNT)
     parser.add_argument("--native-text-stream", action="store_true")
     parser.add_argument("--retry-failed-only", action="store_true")
     parser.add_argument("--results", type=Path, nargs="*", default=[])
@@ -842,6 +858,11 @@ def main():
             if args.source_path_prefix:
                 rendered = {key: value for key, value in rendered.items()
                             if str(value.get("path", "")).startswith(args.source_path_prefix)}
+            if args.ocr_lane_index is not None:
+                if not 0 <= args.ocr_lane_index < args.ocr_lane_count:
+                    parser.error("OCR lane index must be within the configured lane count")
+                rendered = {key: value for key, value in rendered.items()
+                            if ocr_lane_index(key, args.ocr_lane_count) == args.ocr_lane_index}
             overrides = json.loads(args.layout_overrides.read_text(encoding="utf-8")) if args.layout_overrides.is_file() else {}
             queue = plan_images(rendered, current,
                                 lambda keys: pdf_ocr_progress.load_progress(api, repo, keys, revision), args.limit,
