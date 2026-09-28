@@ -27,10 +27,10 @@ from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import get_session, hf_raise_for_status
 
 try:
-    from . import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout
+    from . import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout, pdf_ocr_progress
     from .run_pdf_ocr import source_path, _bucket_retry_delay
 except ImportError:
-    import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout
+    import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout, pdf_ocr_progress
     from run_pdf_ocr import source_path, _bucket_retry_delay
 
 RENDER_REGISTRY = "pdf_render_manifest.json"
@@ -544,7 +544,7 @@ def reuse_recognized_pages(old, entry, pages):
 
 
 def plan_images(rendered, current, progress, limit=20, target=500, overrides=None,
-                retry_failed_only=False):
+                 retry_failed_only=False):
     if limit < 1 or target < 1:
         raise ValueError("limit and target must be positive")
     books, tasks = [], []
@@ -581,13 +581,21 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         if entry["status"] == "skipped":
             books.append(entry)
             continue
+        books.append({**entry, "pages": manifest["pages"]})
+    if callable(progress):
+        progress = progress([book["key"] for book in books if book["status"] != "skipped"])
+    for book in books:
+        if book["status"] == "skipped":
+            continue
+        key = book["key"]
+        entry = book
+        old = current.get(key, {})
         generation = generation_for(entry)
         previous = progress.get(key, {})
         saved = previous.get("pages", {}) if previous.get("generation") == generation else reuse_recognized_pages(
-            old, entry, manifest["pages"])
-        book = {**entry, "pages": manifest["pages"], "saved": saved}
-        books.append(book)
-        pending = [p for p in manifest["pages"] if p["source"] == "ocr" and str(p["p"]) not in saved]
+            old, entry, book["pages"])
+        book["saved"] = saved
+        pending = [p for p in book["pages"] if p["source"] == "ocr" and str(p["p"]) not in saved]
         # Fast ONNX recognition benefits from fewer model startups. Keep the
         # slower multilingual Paddle backend below a conservative task size so
         # one shard cannot approach the runner timeout.
@@ -595,7 +603,7 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         for start in range(0, len(pending), task_target):
             tasks.append({"key": key, "generation": generation, "profile": entry["profile"],
                           "ocr_language": entry["ocr_language"], "ocr_backend": entry["ocr_backend"],
-                          "source_sha256": entry["source_sha256"], "layout_options": options,
+                          "source_sha256": entry["source_sha256"], "layout_options": entry["layout_options"],
                           "pages": pending[start:start + task_target]})
     # Pack small books together, while large books can span several workers.
     count = min(256, len(tasks), max(1, math.ceil(sum(len(t["pages"]) for t in tasks) / target)))
@@ -826,7 +834,6 @@ def main():
             render_progress = load_registry(api, repo, RENDER_PROGRESS_REGISTRY, revision)["files"]
             queue = plan_render_ranges(queue, render_progress, force_reprobe=args.force_reprobe)
         else:
-            progress = load_registry(api, repo, PROGRESS_REGISTRY, revision)["files"]
             if args.source_repo:
                 rendered = {key: value for key, value in rendered.items()
                             if value.get("repo") == args.source_repo}
@@ -834,9 +841,10 @@ def main():
                 rendered = {key: value for key, value in rendered.items()
                             if str(value.get("path", "")).startswith(args.source_path_prefix)}
             overrides = json.loads(args.layout_overrides.read_text(encoding="utf-8")) if args.layout_overrides.is_file() else {}
-            queue = plan_images(rendered, current, progress, args.limit,
-                                plan_pdf_ocr.ocr_target_pages_per_shard(), overrides,
-                                retry_failed_only=args.retry_failed_only)
+            queue = plan_images(rendered, current,
+                                lambda keys: pdf_ocr_progress.load_progress(api, repo, keys, revision), args.limit,
+                                 plan_pdf_ocr.ocr_target_pages_per_shard(), overrides,
+                                 retry_failed_only=args.retry_failed_only)
         args.queue.parent.mkdir(parents=True, exist_ok=True)
         pdf_ocr.write_json(args.queue, queue)
         print(f"{args.stage}: {queue['shard_count']} shards", flush=True)
@@ -897,7 +905,7 @@ def main():
     if args.stage == "publish-ocr":
         results = read_results(result_paths(args.results, args.results_dir, bool(queue["shards"])))
         updates = collect_progress(queue, results)
-        save_registry(api, repo, PROGRESS_REGISTRY, updates, merge_progress)
+        pdf_ocr_progress.save_progress(api, repo, updates)
         completed = []
         for book in queue["books"]:
             try:

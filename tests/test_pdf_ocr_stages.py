@@ -193,6 +193,15 @@ class PdfOcrStagesTests(unittest.TestCase):
             self.assertTrue(manifest["complete"])
             self.assertEqual(manifest["page_manifest"], result["page_manifest"])
 
+    def test_plan_loads_progress_only_for_selected_non_skipped_books(self):
+        result = self.render_fixture()
+        skipped = {**result, "key": "repo\0skip.pdf", "status": "skipped"}
+        lookup = Mock(return_value={})
+        with patch.object(stages, "read_object", side_effect=self.read):
+            queue = stages.plan_images({result["key"]: result, skipped["key"]: skipped}, {}, lookup)
+        lookup.assert_called_once_with([result["key"]])
+        self.assertEqual(set(book["key"] for book in queue["books"]), {result["key"], skipped["key"]})
+
     def test_page_checksum_failure_does_not_publish_ready(self):
         result = self.render_fixture()
         with patch.object(stages, "read_object", side_effect=self.read):

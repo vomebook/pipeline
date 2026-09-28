@@ -23,6 +23,10 @@ on:
         description: Resume only incomplete or failed OCR books from saved page progress
         default: false
         type: boolean
+      recover_run:
+        description: Publish existing OCR artifacts from a completed main-branch OCR run
+        default: ""
+        type: string
       source_repo:
         description: Exact source dataset filter, or blank for all
         default: ""
@@ -34,6 +38,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: pdf-image-ocr-assets
@@ -54,6 +59,7 @@ jobs:
           python-version: "3.11"
       - run: pip install -r scripts/requirements.txt
       - name: Plan only published high quality PNG inputs
+        if: inputs.recover_run == ''
         id: plan
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -73,6 +79,7 @@ jobs:
           echo "shard_count=$(jq -r '.shard_count' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
           echo "shard_ids=$(jq -c '.shard_ids' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
+        if: inputs.recover_run == ''
         with:
           name: pdf-image-ocr-queue
           path: output/pdf-ocr/queue.json
@@ -80,7 +87,7 @@ jobs:
 
   build:
     needs: plan
-    if: needs.plan.outputs.shard_count != '0'
+    if: inputs.recover_run == '' && needs.plan.outputs.shard_count != '0'
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     strategy:
@@ -132,15 +139,28 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r scripts/requirements.txt
+      - name: Validate recovery run identity
+        if: inputs.recover_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVER_RUN: ${{ inputs.recover_run }}
+        run: |
+          [[ "$RECOVER_RUN" =~ ^[0-9]+$ ]] || exit 1
+          gh api "repos/${{ github.repository }}/actions/runs/$RECOVER_RUN" > "$RUNNER_TEMP/recover-run.json"
+          jq -e '.head_branch == "main" and .path == ".github/workflows/pdf-ocr-assets.yml" and .status == "completed"' "$RUNNER_TEMP/recover-run.json"
       - uses: actions/download-artifact@v8
         with:
           name: pdf-image-ocr-queue
           path: output/pdf-ocr
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.recover_run || github.run_id }}
       - uses: actions/download-artifact@v8
-        if: needs.build.result != 'skipped'
+        if: needs.build.result != 'skipped' || inputs.recover_run != ''
         with:
           pattern: pdf-image-ocr-results-*
           path: output/pdf-ocr/results
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.recover_run || github.run_id }}
       - name: Save page progress and publish complete books
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
