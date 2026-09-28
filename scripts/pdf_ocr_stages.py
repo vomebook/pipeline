@@ -907,17 +907,24 @@ def main():
         updates = collect_progress(queue, results)
         pdf_ocr_progress.save_progress(api, repo, updates)
         completed = []
-        for book in queue["books"]:
-            try:
-                saved = updates.get(book["key"], {}).get("pages", book.get("saved", {}))
-                with tempfile.TemporaryDirectory(dir=args.output) as temp:
-                    result = assemble_book(book, saved, Path(temp))
-                    if result["status"] == "ready":
-                        upload_objects(Path(temp))
-                completed.append(result)
-            except Exception as exc:
-                completed.append({**public_item({k: v for k, v in book.items() if k not in {"pages", "saved"}}),
-                                  "status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]})
+        # Upload generated book manifests in bounded groups. One sync per book
+        # made large OCR batches spend most of publish time in transfer setup.
+        for offset in range(0, len(queue["books"]), 10):
+            batch = queue["books"][offset:offset + 10]
+            with tempfile.TemporaryDirectory(dir=args.output) as temp:
+                pending_uploads = []
+                for book in batch:
+                    try:
+                        saved = updates.get(book["key"], {}).get("pages", book.get("saved", {}))
+                        result = assemble_book(book, saved, Path(temp))
+                        if result["status"] == "ready":
+                            pending_uploads.append(result)
+                        completed.append(result)
+                    except Exception as exc:
+                        completed.append({**public_item({k: v for k, v in book.items() if k not in {"pages", "saved"}}),
+                                          "status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]})
+                if pending_uploads:
+                    upload_objects(Path(temp))
         if completed:
             publication.publish(api, repo, completed)
         print(f"published {len(completed)} books; incomplete books retain page progress", flush=True)
