@@ -531,13 +531,43 @@ def reader_webp_quality(image, full_page_scan: bool) -> int:
                                     and colorful / count <= .03) else WEBP_QUALITY
 
 
+def prerender_pages(path: Path, pages: range, directory: Path) -> set[int]:
+    """Render a short uniform-DPI range; fall back to individual pages on failure."""
+    if len(pages) < 2:
+        return set()
+    dpis = {_page_render_dpi(path, page) for page in pages}
+    if len(dpis) != 1:
+        return set()
+    prefix = directory / "render-batch"
+    try:
+        _run(["pdftocairo", "-png", "-r", str(dpis.pop()), "-f", str(pages.start),
+              "-l", str(pages.stop - 1), str(path), str(prefix)],
+             timeout=COMMAND_TIMEOUT * len(pages))
+        staged = list(directory.glob("render-batch-*.png"))
+        produced = {int(image.stem.rsplit("-", 1)[1]): image for image in staged}
+        if set(produced) != set(pages) or len(staged) != len(pages):
+            raise RuntimeError("incomplete batch render")
+        for page, image in produced.items():
+            image.replace(directory / f"page-{page:06d}.png")
+        return set(pages)
+    except (RuntimeError, OSError, ValueError):
+        for page in pages:
+            (directory / f"page-{page:06d}.png").unlink(missing_ok=True)
+        return set()
+    finally:
+        for image in directory.glob("render-batch-*.png"):
+            image.unlink(missing_ok=True)
+
+
 def render_page(path: Path, page: int, directory: Path,
-                reader_pixels: tuple[int, int] | None = None, reader_jxl: bool = False) -> tuple[Path, int, int]:
+                reader_pixels: tuple[int, int] | None = None, reader_jxl: bool = False,
+                *, prepared: bool = False) -> tuple[Path, int, int]:
     prefix = directory / f"page-{page:06d}"
-    _run([
-        "pdftocairo", "-png", "-singlefile", "-r", str(_page_render_dpi(path, page)),
-        "-f", str(page), "-l", str(page), str(path), str(prefix),
-    ], timeout=COMMAND_TIMEOUT)
+    if not prepared:
+        _run([
+            "pdftocairo", "-png", "-singlefile", "-r", str(_page_render_dpi(path, page)),
+            "-f", str(page), "-l", str(page), str(path), str(prefix),
+        ], timeout=COMMAND_TIMEOUT)
     png = prefix.with_suffix(".png")
     if not png.is_file():
         raise RuntimeError(f"page {page} render missing")

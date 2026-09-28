@@ -4,6 +4,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -208,6 +209,47 @@ class PdfOcrStagesTests(unittest.TestCase):
                                                   self.root / "result")["status"], "failed")
             retried = stages.plan_images({result["key"]: result}, {}, progress)
             self.assertEqual(retried["total_ocr_pages"], 1)
+
+    def test_prefetch_keeps_order_and_continues_after_download_error(self):
+        result = self.render_fixture()
+        with patch.object(stages, "read_object", side_effect=self.read):
+            task = stages.plan_images({result["key"]: result}, {}, {})["shards"][0][0]
+        first = task["pages"][0]
+        task["pages"] = [first, {**first, "p": first["p"] + 1}]
+        source = self.read(stages.page_meta(first, "i"))
+        calls = iter((ValueError("download failed"), source))
+        def download(_meta, _suffix):
+            value = next(calls)
+            if isinstance(value, Exception):
+                raise value
+            return value
+        with patch.object(stages, "read_object", side_effect=download), \
+                patch.object(pdf_ocr, "ocr_page", return_value=[]):
+            recognized = stages.recognize_task(task, self.root / "prefetch")
+        self.assertEqual([error["page"] for error in recognized["errors"]], [first["p"]])
+        self.assertEqual([page["p"] for page in recognized["pages"]], [first["p"] + 1])
+
+    def test_next_input_download_overlaps_current_page_recognition(self):
+        result = self.render_fixture()
+        with patch.object(stages, "read_object", side_effect=self.read):
+            task = stages.plan_images({result["key"]: result}, {}, {})["shards"][0][0]
+        first = task["pages"][0]
+        task["pages"] = [first, {**first, "p": first["p"] + 1}]
+        source = self.read(stages.page_meta(first, "i"))
+        next_downloaded = threading.Event()
+        downloads = iter((1, 2))
+        def download(_meta, _suffix):
+            if next(downloads) == 2:
+                next_downloaded.set()
+            return source
+        def recognize(_path, _width, _height, *_config):
+            self.assertTrue(next_downloaded.wait(2))
+            return []
+        with patch.object(stages, "read_object", side_effect=download), \
+                patch.object(pdf_ocr, "ocr_page", side_effect=recognize):
+            recognized = stages.recognize_task(task, self.root / "overlapped-ocr")
+        self.assertEqual(recognized["errors"], [])
+        self.assertEqual([page["p"] for page in recognized["pages"]], [first["p"], first["p"] + 1])
 
     def test_500_page_tasks_split_large_books_and_keep_every_page(self):
         result = self.render_fixture()

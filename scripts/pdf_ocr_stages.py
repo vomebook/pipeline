@@ -16,6 +16,7 @@ import os
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import quote
@@ -307,6 +308,7 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
                    else {})
     with tempfile.TemporaryDirectory(dir=bundle) as temp, (
             lin_pdf_text.open_pdf(source) if lin_native else nullcontext(None)) as document:
+        prepared = set()
         for number in range(item.get("start", 1), item.get("end", probe["page_count"]) + 1):
             if probe["classification"] == "native-text" and not force_image_render:
                 text = lin_pdf_text.extract(document, number) if lin_native else pdf_ocr.native_page(source, number)
@@ -322,10 +324,13 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
                 set_page_meta(page, "o", metadata(out, bundle))
                 pages.append(page)
                 continue
+            if (number - first) % 4 == 0:
+                prepared = pdf_ocr.prerender_pages(source, range(number, min(number + 4, last + 1)), Path(temp))
             native = probe["classification"] == "native-text" or probe["page_chars"][number - 1] >= pdf_ocr.MIN_NATIVE_PAGE_CHARS
             reader_pixels = scan_images.get(number) if not native and probe["page_chars"][number - 1] == 0 else None
+            render_options = {"prepared": True} if number in prepared else {}
             png, width, height = pdf_ocr.render_page(source, number, Path(temp), reader_pixels,
-                                                     reader_jxl=pdf_ocr.JXL_ENABLED)
+                                                     reader_jxl=pdf_ocr.JXL_ENABLED, **render_options)
             page = {"p": number, "source": "native" if native else "ocr", "width": width, "height": height}
             for field, local, folder in (("i", png, "ocr-input"),
                                          ("w", png.with_suffix(".webp"), "pages")):
@@ -598,11 +603,19 @@ def recognize_task(task, bundle):
     root = root_for(task["source_sha256"], task["key"], task["generation"] + task["profile"])
     done, errors = [], []
     bundle.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=bundle) as temp:
+    with tempfile.TemporaryDirectory(dir=bundle) as temp, ThreadPoolExecutor(max_workers=1) as downloads:
         png = Path(temp) / "input.png"
-        for page in task["pages"]:
+        def download(page):
+            return read_object(page_meta(page, "i"), ".png")
+        pages = task["pages"]
+        pending = downloads.submit(download, pages[0]) if pages else None
+        for index, page in enumerate(pages):
             try:
-                png.write_bytes(read_object(page_meta(page, "i"), ".png"))
+                try:
+                    data = pending.result()
+                finally:
+                    pending = downloads.submit(download, pages[index + 1]) if index + 1 < len(pages) else None
+                png.write_bytes(data)
                 from PIL import Image
                 config = task.get("layout_options", {})
                 options = {**config.get("default", {}), **config.get("pages", {}).get(str(page["p"]), {})}
