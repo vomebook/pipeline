@@ -447,23 +447,26 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertEqual(stages.pending_render([item], {}, {item["key"]: {**old, "ocr_manifest": ""}}), [item])
 
     def test_render_partitions_keep_small_and_large_files_independent(self):
-        below_32 = {**self.item(), "source_bytes": stages.TINY_RENDER_MAX_SOURCE_BYTES - 1}
-        at_32 = {**self.item(), "key": "repo\0medium.pdf", "path": "medium.pdf",
-                 "source_bytes": stages.TINY_RENDER_MAX_SOURCE_BYTES}
-        below_100 = {**self.item(), "key": "repo\0large.pdf", "path": "large.pdf",
-                     "source_bytes": stages.SMALL_RENDER_MAX_SOURCE_BYTES - 1}
+        cuts = stages.RENDER_BAND_BYTES
+        bands = ("under16", "16to32", "32to64", "64to100")
+        samples = [
+            {**self.item(), "source_bytes": cuts[0] - 1},
+            {**self.item(), "key": "repo\0b.pdf", "path": "b.pdf", "source_bytes": cuts[0]},
+            {**self.item(), "key": "repo\0c.pdf", "path": "c.pdf", "source_bytes": cuts[1]},
+            {**self.item(), "key": "repo\0d.pdf", "path": "d.pdf", "source_bytes": cuts[2]},
+            {**self.item(), "key": "repo\0e.pdf", "path": "e.pdf", "source_bytes": cuts[3] - 1},
+        ]
+        for item, band in zip(samples[:4], bands):
+            self.assertTrue(stages.render_partition_matches(item, band))
+            self.assertFalse(any(stages.render_partition_matches(item, other)
+                                 for other in bands if other != band))
+        self.assertTrue(stages.render_partition_matches(samples[4], "64to100"))
+        self.assertFalse(stages.render_partition_matches(samples[4], "32to64"))
         at_100 = {**self.item(), "key": "repo\0huge.pdf", "path": "huge.pdf",
-                  "source_bytes": stages.SMALL_RENDER_MAX_SOURCE_BYTES}
-        for item in (below_32,):
-            self.assertTrue(stages.render_partition_matches(item, "under32"))
-            self.assertFalse(stages.render_partition_matches(item, "32to100"))
-        for item in (at_32, below_100):
-            self.assertFalse(stages.render_partition_matches(item, "under32"))
-            self.assertTrue(stages.render_partition_matches(item, "32to100"))
-        self.assertFalse(stages.render_partition_matches(at_100, "under32"))
-        self.assertFalse(stages.render_partition_matches(at_100, "32to100"))
+                  "source_bytes": cuts[3]}
+        self.assertFalse(any(stages.render_partition_matches(at_100, band) for band in bands))
         self.assertTrue(stages.render_partition_matches(at_100, "large"))
-        self.assertTrue(stages.render_partition_matches(below_32, "all"))
+        self.assertTrue(stages.render_partition_matches(samples[0], "all"))
 
     def test_ocr_lanes_are_stable_and_disjoint(self):
         keys = [f"repo\\0book-{index}.pdf" for index in range(300)]
@@ -485,13 +488,13 @@ class PdfOcrStagesTests(unittest.TestCase):
         ocr = (root / ".github/workflows/pdf-ocr-assets.yml").read_text()
         self.assertIn("--source-repo", ocr)
         self.assertIn("--source-path-prefix", ocr)
-        self.assertIn("group: ${{ format('pdf-render-small-inputs-{0}', inputs.render_band || 'under32') }}", small)
+        self.assertIn("group: ${{ format('pdf-render-small-inputs-{0}', inputs.render_band || 'under16') }}", small)
         self.assertIn("group: reader-assets", small)
-        self.assertIn("32to100", small)
-        self.assertIn("under32", small)
+        for band in ("under16", "16to32", "32to64", "64to100"):
+            self.assertIn(band, small)
         self.assertIn("--ocr-lane-index", ocr)
         small_workflow = yaml.safe_load(small)
-        self.assertEqual(small_workflow[True]["workflow_dispatch"]["inputs"]["render_band"]["default"], "under32")
+        self.assertEqual(small_workflow[True]["workflow_dispatch"]["inputs"]["render_band"]["default"], "under16")
         self.assertEqual(small_workflow["jobs"]["build"]["strategy"]["max-parallel"], 10)
         ocr_workflow = yaml.safe_load(ocr)
         self.assertEqual(ocr_workflow[True]["workflow_dispatch"]["inputs"]["lane_index"]["default"], "0")

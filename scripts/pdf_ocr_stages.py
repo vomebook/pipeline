@@ -40,8 +40,9 @@ RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
 BUCKET = "hf://buckets/vomebook/pdf-pages"
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
-TINY_RENDER_MAX_SOURCE_BYTES = 32 * 1024 * 1024
-OCR_LANE_COUNT = 2
+RENDER_BAND_BYTES = (16 * 1024 * 1024, 32 * 1024 * 1024,
+                     64 * 1024 * 1024, SMALL_RENDER_MAX_SOURCE_BYTES)
+OCR_LANE_COUNT = 4
 VERIFIED_SCAN_GBK_PDFS = frozenset(
     "VoiceOfML/Teachers\0A1 马克思&恩格斯/01-04 马克思恩格斯全集 林一章新版/" + name + ".pdf"
     for name in (
@@ -200,11 +201,16 @@ def render_partition_matches(item, partition):
         return True
     size = int(item.get("source_bytes") or 0)
     if not size:
-        return partition in {"small", "under32"}
-    if partition == "under32":
-        return size < TINY_RENDER_MAX_SOURCE_BYTES
-    if partition == "32to100":
-        return TINY_RENDER_MAX_SOURCE_BYTES <= size < SMALL_RENDER_MAX_SOURCE_BYTES
+        return partition in {"small", "under16"}
+    bands = {
+        "under16": (0, RENDER_BAND_BYTES[0]),
+        "16to32": (RENDER_BAND_BYTES[0], RENDER_BAND_BYTES[1]),
+        "32to64": (RENDER_BAND_BYTES[1], RENDER_BAND_BYTES[2]),
+        "64to100": (RENDER_BAND_BYTES[2], RENDER_BAND_BYTES[3]),
+    }
+    if partition in bands:
+        lower, upper = bands[partition]
+        return lower <= size < upper
     if partition == "small":
         return size < SMALL_RENDER_MAX_SOURCE_BYTES
     return size >= SMALL_RENDER_MAX_SOURCE_BYTES
@@ -813,7 +819,7 @@ def main():
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--checkpoint", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true")
-    parser.add_argument("--partition", choices=("all", "small", "under32", "32to100", "large"), default="all")
+    parser.add_argument("--partition", choices=("all", "small", "under16", "16to32", "32to64", "64to100", "large"), default="all")
     parser.add_argument("--ocr-lane-index", type=int)
     parser.add_argument("--ocr-lane-count", type=int, default=OCR_LANE_COUNT)
     parser.add_argument("--native-text-stream", action="store_true")

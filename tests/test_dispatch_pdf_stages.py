@@ -61,7 +61,7 @@ class DispatchPdfStagesTests(unittest.TestCase):
             self.assertTrue(controller.dispatch(REPO, "token", "small", "100", "success"))
             self.assertFalse(controller.dispatch(REPO, "token", "small"))
         self.assertEqual(len(api.posts), 1)
-        self.assertEqual(api.posts[0][2], {"ref": "main", "inputs": {"render_band": "under32"}})
+        self.assertEqual(api.posts[0][2], {"ref": "main", "inputs": {"render_band": "under16"}})
         self.assertEqual(sleep.call_count, 2)
 
     def test_empty_or_failed_worker_does_not_trigger_another_immediate_run(self):
@@ -121,18 +121,18 @@ class DispatchPdfStagesTests(unittest.TestCase):
     def test_dispatch_carries_selected_render_band_and_ocr_lane(self):
         api = FakeGitHub()
         with patch.object(controller, "urlopen", side_effect=api.open):
-            self.assertTrue(controller.dispatch(REPO, "token", "small", render_band="32to100"))
+            self.assertTrue(controller.dispatch(REPO, "token", "small", render_band="32to64"))
         api.runs[REPO].clear()
         with patch.object(controller, "urlopen", side_effect=api.open):
-            self.assertTrue(controller.dispatch(REPO, "token", "ocr", ocr_lane_index=1))
-        self.assertEqual(api.posts[0][2]["inputs"], {"render_band": "32to100"})
-        self.assertEqual(api.posts[1][2]["inputs"], {"lane_index": "1"})
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr", ocr_lane_index=3))
+        self.assertEqual(api.posts[0][2]["inputs"], {"render_band": "32to64"})
+        self.assertEqual(api.posts[1][2]["inputs"], {"lane_index": "3"})
 
     def test_invalid_render_band_or_ocr_lane_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "render band"):
             controller.dispatch(REPO, "token", "small", render_band="large")
         with self.assertRaisesRegex(ValueError, "lane index"):
-            controller.dispatch(REPO, "token", "ocr", ocr_lane_index=2)
+            controller.dispatch(REPO, "token", "ocr", ocr_lane_index=4)
 
     def test_api_error_and_malformed_response_fail_closed(self):
         api = FakeGitHub()

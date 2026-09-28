@@ -9,7 +9,7 @@ on:
         type: string
       render_band:
         description: Source PDF size band assigned to this runner
-        default: "under32"
+        default: "under16"
         type: string
       generate_jxl:
         description: Also encode optional JXL page images (Reader currently uses WebP)
@@ -36,7 +36,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: ${{ format('pdf-render-small-inputs-{0}', inputs.render_band || 'under32') }}
+  group: ${{ format('pdf-render-small-inputs-{0}', inputs.render_band || 'under16') }}
   cancel-in-progress: false
   queue: max
 
@@ -67,14 +67,14 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           LIMIT: ${{ inputs.limit || '100' }}
-          RENDER_BAND: ${{ inputs.render_band || 'under32' }}
+          RENDER_BAND: ${{ inputs.render_band || 'under16' }}
           RETRY_FAILED: ${{ github.event_name == 'schedule' || inputs.retry_failed }}
           SOURCE_REPO: ${{ inputs.source_repo || '' }}
           SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
           FORCE_REPROBE: ${{ inputs.force_reprobe || 'false' }}
         run: |
           [[ "$LIMIT" =~ ^[0-9]+$ ]] && ((10#$LIMIT >= 1 && 10#$LIMIT <= 100)) || exit 1
-          [[ "$RENDER_BAND" == under32 || "$RENDER_BAND" == 32to100 ]] || exit 1
+          [[ "$RENDER_BAND" == under16 || "$RENDER_BAND" == 16to32 || "$RENDER_BAND" == 32to64 || "$RENDER_BAND" == 64to100 ]] || exit 1
           args=()
           if [[ "$RETRY_FAILED" == true ]]; then args+=(--retry-failed); fi
           if [[ "$FORCE_REPROBE" == true ]]; then args+=(--force-reprobe); fi

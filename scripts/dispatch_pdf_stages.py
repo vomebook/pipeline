@@ -58,13 +58,13 @@ def completed_with_work(repo, run_id, headers):
 
 
 def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
-             render_band="under32", ocr_lane_index=0, upstream_token=""):
+             render_band="under16", ocr_lane_index=0, upstream_token=""):
     if not repo or not token or worker not in WORKFLOWS:
         raise ValueError("REPO, GH_TOKEN and a valid worker are required")
-    if worker == "small" and render_band not in {"under32", "32to100"}:
+    if worker == "small" and render_band not in {"under16", "16to32", "32to64", "64to100"}:
         raise ValueError("invalid small PDF render band")
-    if worker == "ocr" and (type(ocr_lane_index) is not int or not 0 <= ocr_lane_index < 2):
-        raise ValueError("OCR lane index must be between 0 and 1")
+    if worker == "ocr" and (type(ocr_lane_index) is not int or not 0 <= ocr_lane_index < 4):
+        raise ValueError("OCR lane index must be between 0 and 3")
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
     if completed_run_id:
@@ -108,7 +108,7 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("worker", choices=WORKFLOWS)
-    parser.add_argument("--render-band", choices=("under32", "32to100"), default="under32")
+    parser.add_argument("--render-band", choices=("under16", "16to32", "32to64", "64to100"), default="under16")
     parser.add_argument("--lane-index", type=int, default=0)
     args = parser.parse_args()
     dispatch(os.environ.get("REPO"), os.environ.get("GH_TOKEN"), args.worker,
