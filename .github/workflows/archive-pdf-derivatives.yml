@@ -40,7 +40,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: archive-pdf-derivatives-${{ inputs.mode || 'migrate-png' }}
+  group: archive-pdf-derivatives-${{ inputs.mode || 'migrate-png' }}-${{ inputs.checkpoint || '0' }}
   cancel-in-progress: false
   queue: max
 

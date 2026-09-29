@@ -68,6 +68,7 @@ class ArchivePdfDerivativeTests(unittest.TestCase):
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
         self.assertEqual(inputs["archive_bucket"]["default"], "")
         self.assertFalse(inputs["apply"]["default"])
+        self.assertIn("inputs.checkpoint", workflow["concurrency"]["group"])
         text = Path("scripts/archive_pdf_derivatives.py").read_text()
         self.assertIn('archived["png_source"]', text)
         self.assertNotIn('archived["png"] = file_meta(png_target, root)', text.split('if mode == "convert-jxl":', 1)[1])
