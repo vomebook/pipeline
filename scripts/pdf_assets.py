@@ -73,7 +73,8 @@ def object_root(source_sha: str, key: str) -> Path:
 
 
 def compact_page_manifest(source_sha: str, profile: str, pages: list[dict],
-                          toc: list[dict] | None = None, manifest_dir: Path | None = None) -> dict:
+                          toc: list[dict] | None = None, manifest_dir: Path | None = None,
+                          ocr_pages: list[dict] | None = None) -> dict:
     if not pages:
         raise ValueError("PDF page manifest must contain at least one page")
     manifest_dir = manifest_dir or Path(str(pages[0].get("path") or "")).parent.parent
@@ -90,6 +91,20 @@ def compact_page_manifest(source_sha: str, profile: str, pages: list[dict],
     }
     if toc:
         manifest["toc"] = toc
+    if ocr_pages is not None:
+        if len(ocr_pages) != len(pages):
+            raise ValueError("PDF OCR page manifest must match image page count")
+        checked = []
+        for number, page in enumerate(ocr_pages, 1):
+            path = page.get("o")
+            if (page.get("page") != number or not isinstance(path, str)
+                    or not path.endswith(f"/ocr/page-{number:06d}.json.gz")
+                    or not isinstance(page.get("os"), str)
+                    or len(page["os"]) != 64
+                    or not isinstance(page.get("ob"), int) or page["ob"] <= 0):
+                raise ValueError("invalid PDF OCR page reference")
+            checked.append({"p": number, "o": path, "os": page["os"], "ob": page["ob"]})
+        manifest["ocr"] = checked
     return manifest
 
 

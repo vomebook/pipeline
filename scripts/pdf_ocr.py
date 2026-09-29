@@ -822,6 +822,8 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
     if image_pages and not reuse_previous:
         page_manifest = pdf_assets.compact_page_manifest(
             source_sha, asset_profile(), image_pages, manifest_dir=root,
+            ocr_pages=[{"page": entry["p"], "o": entry["o"], "os": entry["os"], "ob": entry["ob"]}
+                        for entry in page_results],
         )
         page_manifest_path = bundle / root / "page-manifest.json"
         page_manifest_sha, page_manifest_bytes = write_json(page_manifest_path, page_manifest)
