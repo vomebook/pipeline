@@ -199,6 +199,7 @@ def main() -> int:
     parser.add_argument("--archive-bucket", default=os.environ.get("ARCHIVE_BUCKET", ""))
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--checkpoint", type=int, default=0)
+    parser.add_argument("--list-checkpoints", action="store_true")
     parser.add_argument("--source-repo", default="")
     parser.add_argument("--source-path-prefix", default="")
     parser.add_argument("--distance", type=float, default=1.5)
@@ -215,6 +216,10 @@ def main() -> int:
     selected = select_books(load_registry(api, args.assets_repo), limit=args.limit,
                             checkpoint=args.checkpoint, source_repo=args.source_repo,
                             source_path_prefix=args.source_path_prefix)
+    if args.list_checkpoints:
+        count = (len(selected) + args.limit - 1) // args.limit if args.limit else 1
+        print(json.dumps(list(range(args.checkpoint, args.checkpoint + count)), separators=(",", ":")))
+        return 0
     report = {"mode": args.mode, "archive_bucket": args.archive_bucket,
               "selected": len(selected), "applied": args.apply, "results": []}
     args.output.mkdir(parents=True, exist_ok=True)

@@ -16,9 +16,13 @@ on:
         default: "100"
         type: string
       checkpoint:
-        description: Zero-based checkpoint number when limit is set
+        description: Starting checkpoint; with all_checkpoints enabled, process this and every later checkpoint
         default: "0"
         type: string
+      all_checkpoints:
+        description: Process all remaining checkpoints with bounded parallel workers
+        default: false
+        type: boolean
       source_repo:
         description: Exact source dataset filter, or blank for all
         default: ""
@@ -40,14 +44,52 @@ permissions:
   contents: read
 
 concurrency:
-  group: archive-pdf-derivatives-${{ inputs.mode || 'migrate-png' }}-${{ inputs.checkpoint || '0' }}
+  group: archive-pdf-derivatives-${{ inputs.mode || 'migrate-png' }}
   cancel-in-progress: false
   queue: max
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      checkpoint_ids: ${{ steps.plan.outputs.checkpoint_ids }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r scripts/requirements-pdf-ocr.txt
+      - id: plan
+        env:
+          HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
+          ARCHIVE_BUCKET: ${{ inputs.archive_bucket || (inputs.mode == 'convert-jxl' && 'melsm/pdf-jxl' || 'melsm/pdf-archive') }}
+        run: |
+          [[ "$ARCHIVE_BUCKET" != "vomebook/pdf-pages" ]] || exit 1
+          [[ "${{ inputs.limit || '100' }}" =~ ^[0-9]+$ ]] || exit 1
+          [[ "${{ inputs.checkpoint || '0' }}" =~ ^[0-9]+$ ]] || exit 1
+          if [[ "${{ inputs.all_checkpoints }}" == "true" ]]; then
+            ids=$(python scripts/archive_pdf_derivatives.py \
+              --mode "${{ inputs.mode || 'migrate-png' }}" \
+              --archive-bucket "$ARCHIVE_BUCKET" \
+              --limit "${{ inputs.limit || '100' }}" \
+              --checkpoint "${{ inputs.checkpoint || '0' }}" \
+              --source-repo "${{ inputs.source_repo || '' }}" \
+              --source-path-prefix "${{ inputs.source_path_prefix || '' }}" \
+              --list-checkpoints)
+          else
+            ids='[${{ inputs.checkpoint || '0' }}]'
+          fi
+          echo "checkpoint_ids=$ids" >> "$GITHUB_OUTPUT"
+
   archive:
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        checkpoint: ${{ fromJSON(needs.plan.outputs.checkpoint_ids) }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -70,7 +112,7 @@ jobs:
             --mode "${{ inputs.mode || 'migrate-png' }}" \
             --archive-bucket "$ARCHIVE_BUCKET" \
             --limit "${{ inputs.limit || '100' }}" \
-            --checkpoint "${{ inputs.checkpoint || '0' }}" \
+            --checkpoint "${{ matrix.checkpoint }}" \
             --source-repo "${{ inputs.source_repo || '' }}" \
             --source-path-prefix "${{ inputs.source_path_prefix || '' }}" \
             ${{ inputs.apply == true && '--apply' || '' }}
