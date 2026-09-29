@@ -7,6 +7,10 @@ on:
         description: Delete unreferenced WebP/OCR/manifest objects; leave false for dry-run
         default: false
         type: boolean
+      limit:
+        description: Maximum production objects deleted in this run
+        default: "1000"
+        type: string
 
 permissions:
   contents: read
@@ -31,7 +35,9 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           PDF_OCR_ENABLED: ${{ vars.PDF_OCR_ENABLED || 'true' }}
         run: |
+          [[ "${{ inputs.limit || '1000' }}" =~ ^[1-9][0-9]*$ ]] || exit 1
           python scripts/gc_pdf_production_assets.py \
+            --limit "${{ inputs.limit || '1000' }}" \
             ${{ inputs.apply == true && '--apply' || '' }}
       - uses: actions/upload-artifact@v7
         if: always()

@@ -121,28 +121,33 @@ def collect_live(manifest: dict, source_token: str) -> tuple[set[str], set[str],
 
 
 def run(registries: dict, *, apply: bool, ocr_enabled: str,
-        source_token: str, api: HfApi) -> dict:
+        source_token: str, api: HfApi, limit: int = 1000) -> dict:
+    if limit < 1:
+        raise ValueError("limit must be positive")
     if apply and ocr_enabled.lower() != "false":
         raise ValueError("production asset GC requires PDF_OCR_ENABLED=false")
     live, blocked, results = collect_live(registries, source_token)
     files = [getattr(item, "path", "") for item in api.list_bucket_tree(
         PRODUCTION_BUCKET, recursive=True, token=source_token)]
     candidates = sorted(path for path in files if path and candidate_path(path))
-    deletions = [path for path in candidates if path not in live
-                 and not any(path.startswith(prefix) for prefix in blocked)]
+    eligible = [path for path in candidates if path not in live
+                and not any(path.startswith(prefix) for prefix in blocked)]
+    deletions = eligible[:limit]
     if apply and blocked:
         raise RuntimeError("refusing production asset GC because current assets are blocked")
     if apply:
         for start in range(0, len(deletions), 1000):
             api.batch_bucket_files(PRODUCTION_BUCKET, delete=deletions[start:start + 1000], token=source_token)
-    return {"candidates": len(candidates), "live": len(live), "delete": len(deletions),
-            "blocked": len(blocked), "applied": apply, "results": results}
+    return {"candidates": len(candidates), "live": len(live), "eligible": len(eligible),
+            "delete": len(deletions), "limit": limit, "blocked": len(blocked),
+            "applied": apply, "results": results}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--assets-repo", default="vomebook/Reader-Assets")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=Path("output/pdf-production-gc/report.json"))
     args = parser.parse_args()
     token = os.environ.get("HF_TOKEN")
@@ -154,7 +159,7 @@ def main() -> int:
         "pdf_ocr_manifest.json": archive.load_registry(api, args.assets_repo, "pdf_ocr_manifest.json"),
     }
     report = run(registries, apply=args.apply, ocr_enabled=os.environ.get("PDF_OCR_ENABLED", "true"),
-                 source_token=token, api=api)
+                 source_token=token, api=api, limit=args.limit)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                            encoding="utf-8")

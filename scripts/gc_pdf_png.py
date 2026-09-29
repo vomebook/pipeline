@@ -70,7 +70,9 @@ def verify_book(key: str, entry: dict, archive_bucket: str, archive_token: str) 
 
 def run(manifest: dict, *, limit: int, checkpoint: int, archive_bucket: str,
         source_bucket: str, input_bucket: str, apply: bool, source_token: str,
-        archive_token: str) -> dict:
+        archive_token: str, delete_limit: int = 1000) -> dict:
+    if limit < 1 or delete_limit < 1:
+        raise ValueError("limits must be positive")
     if source_bucket != SOURCE_BUCKET:
         raise ValueError("source bucket is fixed to vomebook/pdf-pages")
     archive.validate_bucket(archive_bucket)
@@ -90,12 +92,14 @@ def run(manifest: dict, *, limit: int, checkpoint: int, archive_bucket: str,
     failed = [item for item in results if item["status"] == "failed"]
     if apply and failed:
         raise RuntimeError("refusing PNG deletion because archive verification failed")
+    deletions = paths[:delete_limit]
     if apply:
         api = HfApi(token=source_token)
-        for start in range(0, len(paths), 1000):
-            api.batch_bucket_files(source_bucket, delete=paths[start:start + 1000], token=source_token)
+        for start in range(0, len(deletions), 1000):
+            api.batch_bucket_files(source_bucket, delete=deletions[start:start + 1000], token=source_token)
     return {"selected": len(selected), "verified": len(results) - len(failed),
-            "pngs": len(paths), "applied": apply, "results": results}
+            "pngs": len(paths), "eligible": len(paths), "delete": len(deletions),
+            "limit": delete_limit, "applied": apply, "results": results}
 
 
 def main() -> int:
@@ -105,6 +109,7 @@ def main() -> int:
     parser.add_argument("--archive-bucket", default=PNG_ARCHIVE_BUCKET)
     parser.add_argument("--input-bucket", default=os.environ.get("PDF_OCR_INPUT_BUCKET", ""))
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--delete-limit", type=int, default=1000)
     parser.add_argument("--checkpoint", type=int, default=0)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("output/pdf-png-gc/report.json"))
@@ -118,11 +123,13 @@ def main() -> int:
     report = run(archive.load_registry(HfApi(token=archive_token), args.assets_repo),
                  limit=args.limit, checkpoint=args.checkpoint, archive_bucket=args.archive_bucket,
                  source_bucket=args.source_bucket, input_bucket=args.input_bucket, apply=args.apply,
-                 source_token=source_token, archive_token=archive_token)
+                 source_token=source_token, archive_token=archive_token,
+                 delete_limit=args.delete_limit)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                            encoding="utf-8")
     print(f"selected={report['selected']} verified={report['verified']} pngs={report['pngs']} "
+          f"delete={report['delete']} "
           f"applied={report['applied']}", flush=True)
     return 1 if any(item["status"] == "failed" for item in report["results"]) else 0
 

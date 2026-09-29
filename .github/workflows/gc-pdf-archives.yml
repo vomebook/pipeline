@@ -15,6 +15,10 @@ on:
         description: Delete unreferenced archive objects; leave false for dry-run
         default: false
         type: boolean
+      limit:
+        description: Maximum archive objects deleted in this run
+        default: "1000"
+        type: string
 
 permissions:
   contents: read
@@ -40,9 +44,11 @@ jobs:
           ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
           PDF_OCR_INPUT_BUCKET: ${{ vars.PDF_OCR_INPUT_BUCKET || 'melsm/pdf-archive' }}
         run: |
+          [[ "${{ inputs.limit || '1000' }}" =~ ^[1-9][0-9]*$ ]] || exit 1
           python scripts/gc_pdf_archives.py \
             --mode "${{ inputs.mode || 'png' }}" \
             --input-bucket "$PDF_OCR_INPUT_BUCKET" \
+            --limit "${{ inputs.limit || '1000' }}" \
             ${{ inputs.apply == true && '--apply' || '' }}
       - uses: actions/upload-artifact@v7
         if: always()

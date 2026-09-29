@@ -95,9 +95,12 @@ def verify_live_references(manifest: dict, mode: str, archive_bucket: str,
 
 
 def run(manifest: dict, *, mode: str, archive_bucket: str, input_bucket: str,
-        apply: bool, source_token: str, archive_token: str, api: HfApi) -> dict:
+        apply: bool, source_token: str, archive_token: str, api: HfApi,
+        limit: int = 1000) -> dict:
     if mode not in {"png", "jxl"}:
         raise ValueError("mode must be png or jxl")
+    if limit < 1:
+        raise ValueError("limit must be positive")
     expected_bucket = PNG_BUCKET if mode == "png" else JXL_BUCKET
     archive.validate_bucket(archive_bucket)
     if archive_bucket != expected_bucket:
@@ -109,15 +112,17 @@ def run(manifest: dict, *, mode: str, archive_bucket: str, input_bucket: str,
     files = [getattr(item, "path", "") for item in api.list_bucket_tree(
         archive_bucket, recursive=True, token=archive_token)]
     candidates = sorted(path for path in files if path and candidate_path(mode, path))
-    deletions = [path for path in candidates if path not in live
-                 and not any(path.startswith(prefix) for prefix in blocked)]
+    eligible = [path for path in candidates if path not in live
+                and not any(path.startswith(prefix) for prefix in blocked)]
+    deletions = eligible[:limit]
     if apply and any(item["status"] == "blocked" for item in results):
         raise RuntimeError("refusing archive GC because a current book could not be verified")
     if apply and deletions:
         for start in range(0, len(deletions), 1000):
             api.batch_bucket_files(archive_bucket, delete=deletions[start:start + 1000], token=archive_token)
     return {"mode": mode, "archive_bucket": archive_bucket, "candidates": len(candidates),
-            "live": len(live), "delete": len(deletions), "applied": apply,
+            "live": len(live), "eligible": len(eligible), "delete": len(deletions),
+            "limit": limit, "applied": apply,
             "blocked": len(blocked), "results": results}
 
 
@@ -128,6 +133,7 @@ def main() -> int:
     parser.add_argument("--archive-bucket", default="")
     parser.add_argument("--input-bucket", default=os.environ.get("PDF_OCR_INPUT_BUCKET", ""))
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--output", type=Path, default=Path("output/pdf-archive-gc/report.json"))
     args = parser.parse_args()
     source_token = os.environ.get("HF_TOKEN")
@@ -142,7 +148,8 @@ def main() -> int:
     report = run(archive.load_registry(HfApi(token=source_token), args.assets_repo),
                  mode=args.mode, archive_bucket=args.archive_bucket,
                  input_bucket=args.input_bucket, apply=args.apply,
-                 source_token=source_token, archive_token=archive_token, api=api)
+                 source_token=source_token, archive_token=archive_token, api=api,
+                 limit=args.limit)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                            encoding="utf-8")
