@@ -37,12 +37,12 @@ RENDER_REGISTRY = "pdf_render_manifest.json"
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,95}/[a-z0-9][a-z0-9._-]{0,95}$")
 
 
-def load_registry(api: HfApi, repo: str) -> dict:
-    path = hf_hub_download(repo_id=repo, repo_type="dataset", filename=RENDER_REGISTRY,
+def load_registry(api: HfApi, repo: str, name: str = RENDER_REGISTRY) -> dict:
+    path = hf_hub_download(repo_id=repo, repo_type="dataset", filename=name,
                             token=os.environ.get("HF_TOKEN"))
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("version") != 1 or not isinstance(data.get("files"), dict):
-        raise ValueError(f"invalid {RENDER_REGISTRY}")
+        raise ValueError(f"invalid {name}")
     return data
 
 
