@@ -1,0 +1,53 @@
+name: GC Archived PDF Derivatives
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Archive type to inspect
+        required: true
+        default: png
+        type: choice
+        options:
+          - png
+          - jxl
+      apply:
+        description: Delete unreferenced archive objects; leave false for dry-run
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gc-pdf-archive-${{ inputs.mode || 'png' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  gc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r scripts/requirements.txt
+      - name: Verify references and optionally delete archive objects
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
+          PDF_OCR_INPUT_BUCKET: ${{ vars.PDF_OCR_INPUT_BUCKET || 'melsm/pdf-archive' }}
+        run: |
+          python scripts/gc_pdf_archives.py \
+            --mode "${{ inputs.mode || 'png' }}" \
+            --input-bucket "$PDF_OCR_INPUT_BUCKET" \
+            ${{ inputs.apply == true && '--apply' || '' }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pdf-archive-gc-report-${{ github.run_id }}
+          path: output/pdf-archive-gc/report.json
+          retention-days: 30
+          if-no-files-found: warn
