@@ -440,13 +440,29 @@ class PdfOcrStagesTests(unittest.TestCase):
             self.assertIn("/resolve/objects/", url)
             self.assertNotIn("/api/", url)
 
+    def test_read_png_can_use_the_archive_input_bucket(self):
+        data = b"image"
+        meta = {"path": "objects/aa/" + "a" * 64 + "/" + "b" * 16 + "/ocr-input/page-000001.png",
+                "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+        response = Mock(content=data)
+        with patch.dict("os.environ", {"PDF_OCR_INPUT_BUCKET": "melsm/pdf-archive"}), \
+                patch.object(stages, "get_session") as session, patch.object(stages, "hf_raise_for_status"):
+            session.return_value.get.return_value = response
+            self.assertEqual(stages.read_object(meta), data)
+            url = session.return_value.get.call_args.args[0]
+            self.assertIn("/buckets/melsm/pdf-archive/resolve/", url)
+
     def test_transfers_scope_each_book_not_whole_bucket(self):
         result = self.render_fixture()
-        with patch.object(stages, "HfApi") as api:
+        with patch.object(stages, "HfApi") as api, patch.dict("os.environ", {"ARCHIVE_HF_TOKEN": "archive"}):
             stages.upload_objects(self.root / "render")
-        call = api.return_value.sync_bucket.call_args
-        self.assertTrue(call.args[1].endswith(str(Path(result["render_manifest"]["path"]).parent)))
-        self.assertNotEqual(call.args[1], stages.BUCKET)
+        calls = api.return_value.sync_bucket.call_args_list
+        self.assertEqual(len(calls), 2)
+        production, archive = calls
+        self.assertTrue(production.args[1].endswith(str(Path(result["render_manifest"]["path"]).parent)))
+        self.assertFalse(any(path.startswith("ocr-input/") for path in production.kwargs["include"]))
+        self.assertTrue(any(path.startswith("ocr-input/") for path in archive.kwargs["include"]))
+        self.assertIn("melsm/pdf-archive", archive.args[1])
 
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}

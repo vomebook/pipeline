@@ -32,6 +32,7 @@ except ImportError:
 
 SOURCE_BUCKET = "vomebook/pdf-pages"
 DEFAULT_ARCHIVE_BUCKET = "melsm/pdf-archive"
+DEFAULT_JXL_BUCKET = "melsm/pdf-jxl"
 RENDER_REGISTRY = "pdf_render_manifest.json"
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,95}/[a-z0-9][a-z0-9._-]{0,95}$")
 
@@ -191,7 +192,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=("migrate-png", "convert-jxl"), required=True)
     parser.add_argument("--assets-repo", default="vomebook/Reader-Assets")
     parser.add_argument("--source-bucket", default=SOURCE_BUCKET)
-    parser.add_argument("--archive-bucket", default=os.environ.get("ARCHIVE_BUCKET", DEFAULT_ARCHIVE_BUCKET))
+    parser.add_argument("--archive-bucket", default=os.environ.get("ARCHIVE_BUCKET", ""))
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--checkpoint", type=int, default=0)
     parser.add_argument("--source-repo", default="")
@@ -201,6 +202,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("output/pdf-derivatives"))
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
+    if not args.archive_bucket:
+        args.archive_bucket = DEFAULT_JXL_BUCKET if args.mode == "convert-jxl" else DEFAULT_ARCHIVE_BUCKET
     validate_bucket(args.archive_bucket)
     if not os.environ.get("HF_TOKEN"):
         raise RuntimeError("HF_TOKEN is required")

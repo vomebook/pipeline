@@ -32,8 +32,8 @@ on:
         default: false
         type: boolean
       archive_bucket:
-        description: Public archive bucket namespace/name
-        default: melsm/pdf-archive
+        description: Optional override; defaults to the PNG or JXL bucket for the selected mode
+        default: ""
         type: string
 
 permissions:
@@ -61,7 +61,7 @@ jobs:
       - name: Archive PNG or JXL derivatives
         env:
           HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
-          ARCHIVE_BUCKET: ${{ inputs.archive_bucket || 'melsm/pdf-archive' }}
+          ARCHIVE_BUCKET: ${{ inputs.archive_bucket || (inputs.mode == 'convert-jxl' && 'melsm/pdf-jxl' || 'melsm/pdf-archive') }}
         run: |
           [[ "$ARCHIVE_BUCKET" != "vomebook/pdf-pages" ]] || exit 1
           [[ "${{ inputs.limit || '100' }}" =~ ^[0-9]+$ ]] || exit 1

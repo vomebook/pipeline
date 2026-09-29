@@ -42,6 +42,11 @@ on:
 
 permissions:
   contents: read
+
+env:
+  PDF_OCR_INPUT_BUCKET: ${{ vars.PDF_OCR_INPUT_BUCKET || 'vomebook/pdf-pages' }}
+  PDF_PNG_ARCHIVE_BUCKET: melsm/pdf-archive
+  PDF_JXL_ARCHIVE_BUCKET: melsm/pdf-jxl
   actions: read
 
 concurrency:
@@ -67,6 +72,7 @@ jobs:
         id: plan
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
           LIMIT: ${{ inputs.limit || '100' }}
           OCR_LANE_INDEX: ${{ inputs.lane_index || '0' }}
           PDF_OCR_TARGET_PAGES_PER_SHARD: ${{ inputs.target_pages || '2000' }}
@@ -118,6 +124,7 @@ jobs:
       - name: Recognize verified PNG pages without PDF rendering
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
           PADDLE_PDX_CACHE_HOME: ${{ github.workspace }}/.cache/paddlex
           PDF_OCR_LANG: ${{ inputs.lang || 'auto' }}
           PDF_OCR_BACKEND: ${{ inputs.backend || 'rapidocr_onnxruntime' }}
@@ -170,6 +177,7 @@ jobs:
       - name: Save page progress and publish complete books
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
           PDF_OCR_LANG: ${{ inputs.lang || 'auto' }}
           PDF_OCR_BACKEND: ${{ inputs.backend || 'rapidocr_onnxruntime' }}
         run: python scripts/pdf_ocr_stages.py publish-ocr --results-dir output/pdf-ocr/results

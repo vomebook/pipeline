@@ -39,6 +39,8 @@ RENDER_PROGRESS_REGISTRY = "pdf_render_progress.json"
 RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
 BUCKET = "hf://buckets/vomebook/pdf-pages"
+PNG_ARCHIVE_BUCKET = os.environ.get("PDF_PNG_ARCHIVE_BUCKET", "melsm/pdf-archive")
+JXL_ARCHIVE_BUCKET = os.environ.get("PDF_JXL_ARCHIVE_BUCKET", "melsm/pdf-jxl")
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
 RENDER_BAND_BYTES = (16 * 1024 * 1024, 32 * 1024 * 1024,
                      64 * 1024 * 1024, SMALL_RENDER_MAX_SOURCE_BYTES)
@@ -91,20 +93,46 @@ def retry(operation):
 
 
 def upload_objects(bundle: Path) -> None:
-    """Sync only one book's immutable prefix, never recursively list the whole bucket."""
+    """Sync one book while keeping production and intermediate objects separate."""
     api = HfApi(token=os.environ.get("HF_TOKEN"))
+    archive_token = os.environ.get("ARCHIVE_HF_TOKEN")
     for root in sorted((bundle / "objects").glob("*/*/*")):
         if root.is_dir():
-            retry(lambda: api.sync_bucket(str(root), f"{BUCKET}/{root.relative_to(bundle).as_posix()}",
-                                          quiet=True))
+            production, png, jxl = [], [], []
+            for path in root.rglob("*"):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(root).as_posix()
+                if relative.startswith("ocr-input/") and relative.endswith(".png"):
+                    png.append(relative)
+                elif relative.startswith("pages/") and relative.endswith(".jxl"):
+                    jxl.append(relative)
+                else:
+                    production.append(relative)
+            destination = root.relative_to(bundle).as_posix()
+            if production:
+                retry(lambda: api.sync_bucket(
+                    str(root), f"{BUCKET}/{destination}", include=sorted(production), quiet=True))
+            if (png or jxl) and not archive_token:
+                raise RuntimeError("ARCHIVE_HF_TOKEN is required for PNG/JXL publication")
+            if png:
+                retry(lambda: api.sync_bucket(
+                    str(root), f"hf://buckets/{PNG_ARCHIVE_BUCKET}/{destination}",
+                    include=sorted(png), token=archive_token, quiet=True))
+            if jxl:
+                retry(lambda: api.sync_bucket(
+                    str(root), f"hf://buckets/{JXL_ARCHIVE_BUCKET}/{destination}",
+                    include=sorted(jxl), token=archive_token, quiet=True))
 
 
 def read_object(meta: dict, suffix: str | None = None) -> bytes:
     path = pdf_ocr.validate_ocr_object_path(meta["path"], suffix)
+    bucket = (os.environ.get("PDF_OCR_INPUT_BUCKET", "vomebook/pdf-pages")
+              if "/ocr-input/" in path and path.endswith(".png") else "vomebook/pdf-pages")
     def download():
         # Public object resolve avoids per-page bucket_info/paths-info API calls.
         response = get_session().get(
-            f"https://huggingface.co/buckets/vomebook/pdf-pages/resolve/{quote(path, safe='/')}",
+            f"https://huggingface.co/buckets/{bucket}/resolve/{quote(path, safe='/')}",
             follow_redirects=True, timeout=120)
         hf_raise_for_status(response)
         return response.content

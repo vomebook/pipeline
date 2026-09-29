@@ -66,7 +66,7 @@ class ArchivePdfDerivativeTests(unittest.TestCase):
     def test_jxl_mode_does_not_rearchive_png(self):
         workflow = yaml.safe_load(Path(".github/workflows/archive-pdf-derivatives.yml").read_text())
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
-        self.assertEqual(inputs["archive_bucket"]["default"], "melsm/pdf-archive")
+        self.assertEqual(inputs["archive_bucket"]["default"], "")
         self.assertFalse(inputs["apply"]["default"])
         text = Path("scripts/archive_pdf_derivatives.py").read_text()
         self.assertIn('archived["png_source"]', text)

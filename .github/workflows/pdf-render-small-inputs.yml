@@ -42,6 +42,8 @@ concurrency:
 
 env:
   PDF_JXL_ENABLED: ${{ inputs.generate_jxl == true }}
+  PDF_PNG_ARCHIVE_BUCKET: melsm/pdf-archive
+  PDF_JXL_ARCHIVE_BUCKET: melsm/pdf-jxl
 
 jobs:
   plan:
@@ -60,12 +62,14 @@ jobs:
       - name: Fetch source metadata
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
           FORCE_SYNC: "true"
         run: python scripts/fetch_and_parse.py
       - name: Plan small PDF rendering
         id: plan
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
           LIMIT: ${{ inputs.limit || '100' }}
           RENDER_BAND: ${{ inputs.render_band || 'under16' }}
           RETRY_FAILED: ${{ github.event_name == 'schedule' || inputs.retry_failed }}
