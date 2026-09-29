@@ -1,0 +1,83 @@
+name: Archive PDF Derivatives
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Copy PNG intermediates or convert PNG/WebP pages to JXL
+        required: true
+        default: migrate-png
+        type: choice
+        options:
+          - migrate-png
+          - convert-jxl
+      limit:
+        description: Maximum rendered books in this checkpoint
+        default: "100"
+        type: string
+      checkpoint:
+        description: Zero-based checkpoint number when limit is set
+        default: "0"
+        type: string
+      source_repo:
+        description: Exact source dataset filter, or blank for all
+        default: ""
+        type: string
+      source_path_prefix:
+        description: Source path prefix filter, or blank for all
+        default: ""
+        type: string
+      apply:
+        description: Upload archive objects; leave false for a selection dry-run
+        default: false
+        type: boolean
+      archive_bucket:
+        description: Public archive bucket namespace/name
+        default: melsm/pdf-archive
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-pdf-derivatives-${{ inputs.mode || 'migrate-png' }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r scripts/requirements-pdf-ocr.txt
+      - if: inputs.mode == 'convert-jxl' && inputs.apply
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libjxl-tools
+      - name: Archive PNG or JXL derivatives
+        env:
+          HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
+          ARCHIVE_BUCKET: ${{ inputs.archive_bucket || 'melsm/pdf-archive' }}
+        run: |
+          [[ "$ARCHIVE_BUCKET" != "vomebook/pdf-pages" ]] || exit 1
+          [[ "${{ inputs.limit || '100' }}" =~ ^[0-9]+$ ]] || exit 1
+          [[ "${{ inputs.checkpoint || '0' }}" =~ ^[0-9]+$ ]] || exit 1
+          python scripts/archive_pdf_derivatives.py \
+            --mode "${{ inputs.mode || 'migrate-png' }}" \
+            --archive-bucket "$ARCHIVE_BUCKET" \
+            --limit "${{ inputs.limit || '100' }}" \
+            --checkpoint "${{ inputs.checkpoint || '0' }}" \
+            --source-repo "${{ inputs.source_repo || '' }}" \
+            --source-path-prefix "${{ inputs.source_path_prefix || '' }}" \
+            ${{ inputs.apply == true && '--apply' || '' }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pdf-derivative-archive-report-${{ github.run_id }}
+          path: output/pdf-derivatives/report.json
+          retention-days: 30
+          if-no-files-found: warn
