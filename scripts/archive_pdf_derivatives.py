@@ -108,6 +108,10 @@ def archive_jxl_path(png_path: str) -> str:
     return png_path.replace("/ocr-input/", "/pages/")[:-4] + ".jxl"
 
 
+def archive_manifest_path(key: str, source_sha: str) -> str:
+    return f"manifests/{source_sha}/{hashlib.sha256(key.encode()).hexdigest()}.json"
+
+
 def encode_jxl(png: Path, webp: Path, destination: Path, distance: float, effort: int) -> None:
     with Image.open(png) as source, Image.open(webp) as reference:
         target_size = reference.size
@@ -172,7 +176,7 @@ def archive_book(key: str, entry: dict, *, mode: str, source_bucket: str,
             pages.append(archived)
         if not pages:
             return {"key": key, "status": "skipped", "reason": "no PNG render pages"}
-        archive_path = f"manifests/{render['source_sha256']}/{hashlib.sha256(key.encode()).hexdigest()}.json"
+        archive_path = archive_manifest_path(key, render["source_sha256"])
         archive_target = root / archive_path
         archive_target.parent.mkdir(parents=True, exist_ok=True)
         archive_target.write_text(json.dumps({

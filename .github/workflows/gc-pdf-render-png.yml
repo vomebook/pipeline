@@ -1,0 +1,56 @@
+name: GC Production PDF PNG Inputs
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: Maximum rendered books in this checkpoint
+        default: "100"
+        type: string
+      checkpoint:
+        description: Zero-based checkpoint number when limit is set
+        default: "0"
+        type: string
+      apply:
+        description: Delete only after archive verification; leave false for dry-run
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gc-pdf-render-png
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  gc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r scripts/requirements.txt
+      - name: Verify archive and optionally delete production PNG
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
+          PDF_OCR_INPUT_BUCKET: ${{ vars.PDF_OCR_INPUT_BUCKET || 'melsm/pdf-archive' }}
+        run: |
+          [[ "${{ inputs.limit || '100' }}" =~ ^[0-9]+$ ]] || exit 1
+          [[ "${{ inputs.checkpoint || '0' }}" =~ ^[0-9]+$ ]] || exit 1
+          python scripts/gc_pdf_png.py \
+            --limit "${{ inputs.limit || '100' }}" \
+            --checkpoint "${{ inputs.checkpoint || '0' }}" \
+            --input-bucket "$PDF_OCR_INPUT_BUCKET" \
+            ${{ inputs.apply == true && '--apply' || '' }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pdf-png-gc-report-${{ github.run_id }}
+          path: output/pdf-png-gc/report.json
+          retention-days: 30
+          if-no-files-found: warn
