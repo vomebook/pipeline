@@ -87,7 +87,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 1
       matrix:
         checkpoint: ${{ fromJSON(needs.plan.outputs.checkpoint_ids) }}
     steps:

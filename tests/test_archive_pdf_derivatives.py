@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import yaml
@@ -62,16 +63,27 @@ class ArchivePdfDerivativeTests(unittest.TestCase):
             def download(path, expected_sha, expected_bytes, bucket, token):
                 return render_raw if path == "render-manifest.json" else png
 
-            with patch.object(archive, "download_object", side_effect=download), \
-                 patch.object(archive, "sync_bucket") as sync:
+            with patch.object(archive, "download_object", side_effect=download):
                 result = archive.archive_book("repo\0a.pdf", entry, mode="migrate-png",
                                               source_bucket="vomebook/pdf-pages",
                                               archive_bucket="melsm/pdf-archive", token="token",
                                               api=None, distance=1.5, effort=7, output=output)
             self.assertEqual(result["status"], "ready")
-            includes = sync.call_args.kwargs["include"]
-            self.assertTrue(any(path.endswith("page-000001.png") for path in includes))
-            self.assertTrue(any(path.startswith("manifests/") for path in includes))
+            self.assertEqual(result["copy_paths"], [render["pages"][0]["i"]])
+            self.assertTrue(result["archive_manifest"].startswith("manifests/"))
+
+    def test_png_checkpoint_uses_xet_copy_and_one_manifest_add(self):
+        path = "objects/aa/" + "a" * 64 + "/ocr-input/page-000001.png"
+        api = Mock()
+        api.get_bucket_paths_info.return_value = [Mock(path=path, xet_hash="xet-hash")]
+        result = {"copy_paths": [path], "archive_manifest": "manifests/book.json",
+                  "_archive_payload": {"kind": "pdf-derivative-archive"}}
+        archive.publish_png_checkpoint(api, Path("."), [result], "vomebook/pdf-pages",
+                                       "melsm/pdf-archive", "token")
+        self.assertEqual(api.batch_bucket_files.call_count, 2)
+        copy_call, add_call = api.batch_bucket_files.call_args_list
+        self.assertEqual(copy_call.kwargs["copy"], [("bucket", "vomebook/pdf-pages", "xet-hash", path)])
+        self.assertEqual(add_call.kwargs["add"][0][1], "manifests/book.json")
 
     def test_jxl_mode_does_not_rearchive_png(self):
         workflow = yaml.safe_load(Path(".github/workflows/archive-pdf-derivatives.yml").read_text())
@@ -79,7 +91,7 @@ class ArchivePdfDerivativeTests(unittest.TestCase):
         self.assertEqual(inputs["archive_bucket"]["default"], "")
         self.assertFalse(inputs["apply"]["default"])
         self.assertTrue(inputs["all_checkpoints"]["default"] is False)
-        self.assertEqual(workflow["jobs"]["archive"]["strategy"]["max-parallel"], 4)
+        self.assertEqual(workflow["jobs"]["archive"]["strategy"]["max-parallel"], 1)
         text = Path("scripts/archive_pdf_derivatives.py").read_text()
         self.assertIn('archived["png_source"]', text)
         self.assertNotIn('archived["png"] = file_meta(png_target, root)', text.split('if mode == "convert-jxl":', 1)[1])

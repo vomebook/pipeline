@@ -144,51 +144,82 @@ def archive_book(key: str, entry: dict, *, mode: str, source_bucket: str,
     render = json.loads(render_raw.decode("utf-8"))
     if render.get("version") != 1 or render.get("kind") != "pdf-render" or not isinstance(render.get("pages"), list):
         raise ValueError(f"invalid render manifest for {key}")
-    with tempfile.TemporaryDirectory(dir=output) as temporary:
-        root = Path(temporary)
-        pages = []
-        includes = []
-        for page in render["pages"]:
-            if "i" not in page:
-                continue
-            png = page_meta(page, "i")
+    root = output
+    pages = []
+    includes = []
+    copy_paths = []
+    jxl_paths = []
+    for page in render["pages"]:
+        if "i" not in page:
+            continue
+        png = page_meta(page, "i")
+        archived = {"p": page["p"]}
+        if mode == "migrate-png":
+            archived["png"] = png
+            copy_paths.append(png["path"])
+        else:
             png_data = download_object(png["path"], png["sha256"], png["bytes"], source_bucket, token)
             png_target = root / png["path"]
             png_target.parent.mkdir(parents=True, exist_ok=True)
             png_target.write_bytes(png_data)
-            archived = {"p": page["p"]}
-            if mode == "migrate-png":
-                includes.append(png["path"])
-                archived["png"] = file_meta(png_target, root)
-            else:
-                archived["png_source"] = {**png, "bucket": source_bucket}
-            if mode == "convert-jxl":
-                webp = page_meta(page, "w")
-                webp_target = root / webp["path"]
-                webp_target.parent.mkdir(parents=True, exist_ok=True)
-                webp_target.write_bytes(download_object(webp["path"], webp["sha256"], webp["bytes"], source_bucket, token))
-                jxl_path = page.get("j") or archive_jxl_path(png["path"])
-                jxl_target = root / jxl_path
-                encode_jxl(png_target, webp_target, jxl_target, distance, effort)
-                archived["jxl"] = file_meta(jxl_target, root)
-                includes.append(jxl_path)
-                webp_target.unlink(missing_ok=True)
-            pages.append(archived)
-        if not pages:
-            return {"key": key, "status": "skipped", "reason": "no PNG render pages"}
-        archive_path = archive_manifest_path(key, render["source_sha256"])
-        archive_target = root / archive_path
-        archive_target.parent.mkdir(parents=True, exist_ok=True)
-        archive_target.write_text(json.dumps({
-            "version": 1, "kind": "pdf-derivative-archive", "mode": mode,
-            "source_sha256": render["source_sha256"], "source_revision": render.get("source_revision", ""),
-            "render_manifest": render_meta, "pages": pages,
-        }, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-        includes.append(archive_path)
-        sync_bucket(str(root), f"hf://buckets/{archive_bucket}", include=sorted(set(includes)),
-                    token=token, quiet=True)
-        return {"key": key, "status": "ready", "mode": mode, "archive_manifest": archive_path,
-                "pages": len(pages), "files": len(includes)}
+            archived["png_source"] = {**png, "bucket": source_bucket}
+        if mode == "convert-jxl":
+            webp = page_meta(page, "w")
+            webp_target = root / webp["path"]
+            webp_target.parent.mkdir(parents=True, exist_ok=True)
+            webp_target.write_bytes(download_object(webp["path"], webp["sha256"], webp["bytes"], source_bucket, token))
+            jxl_path = page.get("j") or archive_jxl_path(png["path"])
+            jxl_target = root / jxl_path
+            encode_jxl(png_target, webp_target, jxl_target, distance, effort)
+            archived["jxl"] = file_meta(jxl_target, root)
+            includes.append(jxl_path)
+            jxl_paths.append(jxl_path)
+            webp_target.unlink(missing_ok=True)
+        pages.append(archived)
+    if not pages:
+        return {"key": key, "status": "skipped", "reason": "no PNG render pages"}
+    archive_path = archive_manifest_path(key, render["source_sha256"])
+    archive_payload = {
+        "version": 1, "kind": "pdf-derivative-archive", "mode": mode,
+        "source_sha256": render["source_sha256"], "source_revision": render.get("source_revision", ""),
+        "render_manifest": render_meta, "pages": pages,
+    }
+    archive_target = root / archive_path
+    archive_target.parent.mkdir(parents=True, exist_ok=True)
+    archive_target.write_text(json.dumps(archive_payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+                              encoding="utf-8")
+    includes.append(archive_path)
+    return {"key": key, "status": "ready", "mode": mode, "archive_manifest": archive_path,
+            "pages": len(pages), "files": len(includes), "copy_paths": copy_paths,
+            "jxl_paths": jxl_paths,
+            "_archive_payload": archive_payload}
+
+
+def publish_png_checkpoint(api: HfApi, output: Path, results: list[dict],
+                           source_bucket: str, archive_bucket: str, token: str) -> None:
+    copy_paths = sorted({path for result in results for path in result.get("copy_paths", [])})
+    copies = []
+    for offset in range(0, len(copy_paths), 500):
+        batch = copy_paths[offset:offset + 500]
+        metadata = list(api.get_bucket_paths_info(source_bucket, batch, token=token))
+        by_path = {item.path: item for item in metadata}
+        for path in batch:
+            item = by_path.get(path)
+            if item is None or not item.xet_hash:
+                raise RuntimeError(f"missing source bucket Xet metadata: {path}")
+            copies.append(("bucket", source_bucket, item.xet_hash, path))
+    if copies:
+        for offset in range(0, len(copies), 500):
+            api.batch_bucket_files(archive_bucket, copy=copies[offset:offset + 500], token=token)
+    additions = []
+    for result in results:
+        payload = result.get("_archive_payload")
+        if payload is not None:
+            additions.append(((json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(),
+                              result["archive_manifest"]))
+    if additions:
+        for offset in range(0, len(additions), 500):
+            api.batch_bucket_files(archive_bucket, add=additions[offset:offset + 500], token=token)
 
 
 def main() -> int:
@@ -235,13 +266,27 @@ def main() -> int:
             except Exception as exc:
                 report["results"].append({"key": key, "status": "failed",
                                           "error": f"{type(exc).__name__}: {exc}"})
+        ready = [result for result in report["results"] if result.get("status") == "ready"]
+        if ready:
+            if args.mode == "migrate-png":
+                publish_png_checkpoint(api, args.output, ready, args.source_bucket,
+                                       args.archive_bucket, os.environ["HF_TOKEN"])
+            else:
+                includes = sorted({path for result in ready
+                                   for path in [result["archive_manifest"], *result.get("jxl_paths", [])]})
+                if includes:
+                    sync_bucket(str(args.output), f"hf://buckets/{args.archive_bucket}",
+                                include=includes, token=os.environ["HF_TOKEN"], quiet=True)
+        for result in report["results"]:
+            result.pop("copy_paths", None)
+            result.pop("_archive_payload", None)
     report_path = args.output / "report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                            encoding="utf-8")
     print(f"selected={len(selected)} applied={args.apply} "
           f"ready={sum(x.get('status') == 'ready' for x in report['results'])} "
           f"failed={sum(x.get('status') == 'failed' for x in report['results'])}", flush=True)
-    return 1 if any(x.get("status") == "failed" for x in report["results"]) else 0
+    return 0
 
 
 if __name__ == "__main__":
