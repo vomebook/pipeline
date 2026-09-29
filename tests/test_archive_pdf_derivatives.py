@@ -25,6 +25,16 @@ class ArchivePdfDerivativeTests(unittest.TestCase):
         selected = archive.select_books(manifest, limit=1, checkpoint=1)
         self.assertEqual([key for key, _ in selected], ["repo\0b.pdf"])
 
+    def test_checkpoint_listing_uses_the_full_registry(self):
+        manifest = {"version": 1, "files": {
+            f"repo\0{number:03d}.pdf": {
+                "status": "ready", "repo": "repo", "path": f"{number:03d}.pdf",
+                "render_manifest": {"path": "x", "sha256": "a" * 64, "bytes": 1},
+            } for number in range(250)}}
+        all_books = archive.select_books(manifest, limit=0, checkpoint=0)
+        self.assertEqual(len(all_books), 250)
+        self.assertEqual(list(range(0, (len(all_books) + 99) // 100)), [0, 1, 2])
+
     def test_jxl_path_and_report_are_deterministic(self):
         self.assertEqual(
             archive.archive_jxl_path("objects/aa/" + "a" * 64 + "/ocr-input/page-000001.png"),

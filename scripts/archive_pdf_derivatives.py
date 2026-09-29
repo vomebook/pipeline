@@ -213,12 +213,14 @@ def main() -> int:
     if not os.environ.get("HF_TOKEN"):
         raise RuntimeError("HF_TOKEN is required")
     api = HfApi(token=os.environ["HF_TOKEN"])
-    selected = select_books(load_registry(api, args.assets_repo), limit=args.limit,
-                            checkpoint=args.checkpoint, source_repo=args.source_repo,
-                            source_path_prefix=args.source_path_prefix)
+    registry = load_registry(api, args.assets_repo)
+    selected = select_books(registry, limit=args.limit, checkpoint=args.checkpoint,
+                            source_repo=args.source_repo, source_path_prefix=args.source_path_prefix)
     if args.list_checkpoints:
-        count = (len(selected) + args.limit - 1) // args.limit if args.limit else 1
-        print(json.dumps(list(range(args.checkpoint, args.checkpoint + count)), separators=(",", ":")))
+        all_books = select_books(registry, limit=0, checkpoint=0,
+                                 source_repo=args.source_repo, source_path_prefix=args.source_path_prefix)
+        count = (len(all_books) + args.limit - 1) // args.limit if args.limit else 1
+        print(json.dumps(list(range(args.checkpoint, count)), separators=(",", ":")))
         return 0
     report = {"mode": args.mode, "archive_bucket": args.archive_bucket,
               "selected": len(selected), "applied": args.apply, "results": []}
