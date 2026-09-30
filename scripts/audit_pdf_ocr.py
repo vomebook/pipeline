@@ -200,9 +200,9 @@ def select_entries(manifest: dict, *, source_repo: str = "", source_path_prefix:
 
 
 def load_manifest(api, repo: str) -> tuple[str, dict]:
-    info = api.repo_info(repo_id=repo, repo_type="dataset")
-    path = api.hf_hub_download(repo_id=repo, repo_type="dataset",
-                               filename="pdf_ocr_manifest.json", revision=info.sha)
+    info = pdf_ocr_stages.retry(lambda: api.repo_info(repo_id=repo, repo_type="dataset"))
+    path = pdf_ocr_stages.retry(lambda: api.hf_hub_download(
+        repo_id=repo, repo_type="dataset", filename="pdf_ocr_manifest.json", revision=info.sha))
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("version") != 1 or not isinstance(data.get("files"), dict):
         raise ValueError("invalid PDF OCR manifest")
