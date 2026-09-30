@@ -182,6 +182,7 @@ jobs:
           PDF_OCR_BACKEND: ${{ inputs.backend || 'rapidocr_onnxruntime' }}
         run: python scripts/pdf_ocr_stages.py publish-ocr --results-dir output/pdf-ocr/results
       - name: Queue Reader sidecar publication in main pipeline
+        if: inputs.source_repo != '' && inputs.source_path_prefix != ''
         env:
           GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
           SOURCE_REPO: ${{ inputs.source_repo || '' }}
