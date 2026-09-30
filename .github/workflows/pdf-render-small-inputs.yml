@@ -160,13 +160,20 @@ jobs:
       - name: Queue Reader sidecar publication in main pipeline
         env:
           GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+          SOURCE_REPO: ${{ inputs.source_repo || '' }}
+          SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
         run: |
           set -euo pipefail
           test -n "${GH_TOKEN}"
+          test -n "${SOURCE_REPO}"
+          test -n "${SOURCE_PATH_PREFIX}"
+          jq -n --arg repo "$SOURCE_REPO" --arg path "$SOURCE_PATH_PREFIX" \
+            '{ref:"main",inputs:{repo:$repo,path:$path,limit:"1",checkpoint_batches:"1",bucket_migrate:true,bucket_pdf_staging:false}}' \
+            > "$RUNNER_TEMP/reader-assets-dispatch.json"
           curl --fail-with-body --silent --show-error -X POST \
             --header "Authorization: Bearer ${GH_TOKEN}" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             --header "Content-Type: application/json" \
-            --data '{"ref":"main"}' \
-            "https://api.github.com/repos/anftm/pipeline/actions/workflows/publish-reader-index.yml/dispatches"
+            --data-binary "@$RUNNER_TEMP/reader-assets-dispatch.json" \
+            "https://api.github.com/repos/anftm/pipeline/actions/workflows/reader-assets.yml/dispatches"

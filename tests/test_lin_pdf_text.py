@@ -26,7 +26,9 @@ class LinPdfTextTests(unittest.TestCase):
         workflow = (Path(__file__).parents[1] / ".github/workflows/pdf-render-small-inputs.yml").read_text()
         self.assertIn("if: needs.plan.outputs.shard_count != '0'", workflow)
         self.assertNotIn("actions/workflows/pdf-ocr-assets.yml/dispatches", workflow)
-        self.assertIn("actions/workflows/publish-reader-index.yml/dispatches", workflow)
+        self.assertIn("actions/workflows/reader-assets.yml/dispatches", workflow)
+        self.assertIn('bucket_pdf_staging:false', workflow)
+        self.assertIn('SOURCE_PATH_PREFIX', workflow)
         self.assertIn("SOURCE_PATH_PREFIX", workflow)
 
     def test_planner_marks_only_supported_native_text(self):
