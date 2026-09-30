@@ -1,0 +1,80 @@
+name: Audit PDF OCR Review Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: Maximum completed books to inspect
+        default: "100"
+        type: string
+      lane_index:
+        description: Optional OCR lane index (0-3), or blank for all lanes
+        default: ""
+        type: string
+      source_repo:
+        description: Exact source dataset filter, or blank for all
+        default: ""
+        type: string
+      source_path_prefix:
+        description: Source path prefix filter, or blank for all
+        default: ""
+        type: string
+  workflow_run:
+    workflows: [Build PDF OCR Assets]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pdf-ocr-review
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  audit:
+    if: vars.PDF_OCR_ENABLED != 'false' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      ASSETS_REPO: vomebook/Reader-Assets
+      LIMIT: ${{ inputs.limit || '100' }}
+      LANE_INDEX: ${{ inputs.lane_index || vars.PDF_OCR_LANE_INDEX || '' }}
+      SOURCE_REPO: ${{ inputs.source_repo || '' }}
+      SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - run: pip install -r scripts/requirements.txt
+      - uses: actions/download-artifact@v8
+        if: github.event_name == 'workflow_run'
+        with:
+          name: pdf-image-ocr-queue
+          path: output/trigger-run
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Build OCR review report
+        run: |
+          [[ "$LIMIT" =~ ^[1-9][0-9]*$ ]] && ((10#$LIMIT >= 1 && 10#$LIMIT <= 1000)) || exit 1
+          args=(--assets-repo "$ASSETS_REPO" --limit "$LIMIT" \
+                --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX")
+          if [[ -n "$LANE_INDEX" ]]; then
+            [[ "$LANE_INDEX" =~ ^[0-3]$ ]] || exit 1
+            args+=(--lane-index "$LANE_INDEX")
+          fi
+          if [[ "${{ github.event_name }}" == workflow_run ]]; then
+            args+=(--queue-file output/trigger-run/queue.json)
+          fi
+          python scripts/audit_pdf_ocr.py "${args[@]}"
+          cat output/pdf-ocr-review/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pdf-ocr-review-${{ github.run_id }}
+          path: output/pdf-ocr-review
+          retention-days: 30
+          if-no-files-found: warn
