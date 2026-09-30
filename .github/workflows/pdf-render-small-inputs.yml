@@ -160,6 +160,7 @@ jobs:
           ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
         run: python scripts/pdf_ocr_stages.py publish-render --results-dir output/pdf-ocr/results
       - name: Queue Reader sidecar publication in main pipeline
+        if: inputs.source_repo !=  && inputs.source_path_prefix != 
         env:
           GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
           SOURCE_REPO: ${{ inputs.source_repo || '' }}
