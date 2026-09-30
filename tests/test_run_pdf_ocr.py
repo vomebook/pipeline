@@ -52,6 +52,22 @@ class RunPdfOcrTests(unittest.TestCase):
 
         sleep.assert_called_once_with(5)
 
+    def test_bucket_retry_reads_retry_after_from_error_body(self):
+        response = requests.Response()
+        response.status_code = 429
+        response.request = requests.Request(
+            "POST", "https://huggingface.co/api/buckets/vomebook/pdf-pages/tree"
+        ).prepare()
+        error = HfHubHTTPError(
+            "429 Too Many Requests: Retry after 181 seconds", response=response
+        )
+
+        with patch.object(run_pdf_ocr, "sync_bucket", side_effect=[error, None]), \
+                patch.object(run_pdf_ocr.time, "sleep") as sleep:
+            run_pdf_ocr._sync_bucket_with_retry("/tmp/book", "hf://buckets/vomebook/pdf-pages", "token")
+
+        sleep.assert_called_once_with(181)
+
 
 if __name__ == "__main__":
     unittest.main()

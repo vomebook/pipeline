@@ -42,12 +42,12 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   PDF_OCR_INPUT_BUCKET: ${{ vars.PDF_OCR_INPUT_BUCKET || 'vomebook/pdf-pages' }}
   PDF_PNG_ARCHIVE_BUCKET: melsm/pdf-archive
   PDF_JXL_ARCHIVE_BUCKET: melsm/pdf-jxl
-  actions: read
 
 concurrency:
   group: ${{ format('pdf-image-ocr-assets-{0}', inputs.lane_index || '0') }}

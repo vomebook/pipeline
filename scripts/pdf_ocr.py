@@ -572,7 +572,16 @@ def render_page(path: Path, page: int, directory: Path,
     if not png.is_file():
         raise RuntimeError(f"page {page} render missing")
     from PIL import Image
-    with Image.open(png) as image:
+    # pdftocairo output is produced locally from the checked-out PDF. Pillow's
+    # decompression-bomb guard can reject a legitimate oversized page before
+    # this function gets a chance to enforce the pipeline's lower pixel cap.
+    previous_max_pixels = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        image_context = Image.open(png)
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous_max_pixels
+    with image_context as image:
         width, height = image.size
         rgb = image.convert("RGB")
         if width * height > MAX_PAGE_PIXELS:

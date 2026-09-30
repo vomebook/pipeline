@@ -77,52 +77,53 @@ def public_item(item: dict) -> dict:
 
 
 def retry(operation):
-    for attempt in range(8):
+    # HF API rate windows can outlive the normal transfer retry budget.
+    for attempt in range(15):
         try:
             return operation()
         except HfHubHTTPError as exc:
-            if shared.hf_status_code(exc) not in {408, 429, 499, 500, 502, 503, 504} or attempt == 7:
+            if shared.hf_status_code(exc) not in {408, 429, 499, 500, 502, 503, 504} or attempt == 14:
                 raise
             delay = _bucket_retry_delay(exc, attempt)
         except (httpx.TransportError, ConnectionError, OSError):
-            if attempt == 7:
+            if attempt == 14:
                 raise
-            delay = min(300, 5 * 2 ** attempt)
+            delay = min(900, 5 * 2 ** attempt)
         print(f"temporary object transfer failure; retry in {delay}s", flush=True)
         time.sleep(delay)
 
 
 def upload_objects(bundle: Path) -> None:
-    """Sync one book while keeping production and intermediate objects separate."""
+    """Sync one shard bundle with one transfer session per destination bucket."""
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     archive_token = os.environ.get("ARCHIVE_HF_TOKEN")
-    for root in sorted((bundle / "objects").glob("*/*/*")):
-        if root.is_dir():
-            production, png, jxl = [], [], []
-            for path in root.rglob("*"):
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(root).as_posix()
-                if relative.startswith("ocr-input/") and relative.endswith(".png"):
-                    png.append(relative)
-                elif relative.startswith("pages/") and relative.endswith(".jxl"):
-                    jxl.append(relative)
-                else:
-                    production.append(relative)
-            destination = root.relative_to(bundle).as_posix()
-            if production:
-                retry(lambda: api.sync_bucket(
-                    str(root), f"{BUCKET}/{destination}", include=sorted(production), quiet=True))
-            if (png or jxl) and not archive_token:
-                raise RuntimeError("ARCHIVE_HF_TOKEN is required for PNG/JXL publication")
-            if png:
-                retry(lambda: api.sync_bucket(
-                    str(root), f"hf://buckets/{PNG_ARCHIVE_BUCKET}/{destination}",
-                    include=sorted(png), token=archive_token, quiet=True))
-            if jxl:
-                retry(lambda: api.sync_bucket(
-                    str(root), f"hf://buckets/{JXL_ARCHIVE_BUCKET}/{destination}",
-                    include=sorted(jxl), token=archive_token, quiet=True))
+    production, png, jxl = [], [], []
+    objects = bundle / "objects"
+    if not objects.is_dir():
+        return
+    for path in objects.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(bundle).as_posix()
+        if relative.startswith("objects/") and "/ocr-input/" in relative and relative.endswith(".png"):
+            png.append(relative)
+        elif relative.startswith("objects/") and "/pages/" in relative and relative.endswith(".jxl"):
+            jxl.append(relative)
+        else:
+            production.append(relative)
+    if production:
+        retry(lambda: api.sync_bucket(
+            str(bundle), BUCKET, include=sorted(production), quiet=True))
+    if (png or jxl) and not archive_token:
+        raise RuntimeError("ARCHIVE_HF_TOKEN is required for PNG/JXL publication")
+    if png:
+        retry(lambda: api.sync_bucket(
+            str(bundle), f"hf://buckets/{PNG_ARCHIVE_BUCKET}",
+            include=sorted(png), token=archive_token, quiet=True))
+    if jxl:
+        retry(lambda: api.sync_bucket(
+            str(bundle), f"hf://buckets/{JXL_ARCHIVE_BUCKET}",
+            include=sorted(jxl), token=archive_token, quiet=True))
 
 
 def read_object(meta: dict, suffix: str | None = None) -> bytes:
@@ -1004,25 +1005,41 @@ def main():
         tasks = [{**task, "pages": task["pages"][start:start + 25]}
                  for task in tasks for start in range(0, len(task["pages"]), 25)]
     results = []
-    for task in tasks:
-        try:
-            with tempfile.TemporaryDirectory(dir=args.output) as temp:
+    with tempfile.TemporaryDirectory(dir=args.output) as shard_temp:
+        bundle = Path(shard_temp)
+        for task in tasks:
+            try:
                 if args.stage == "render":
-                    result = render_book(task, source_path(task), Path(temp))
+                    result = render_book(task, source_path(task), bundle)
                 else:
-                    result = recognize_task(task, Path(temp))
-                upload_objects(Path(temp))
-            results.append(result)
+                    result = recognize_task(task, bundle)
+                results.append(result)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"[:1000]
+                if args.stage == "render":
+                    result = {**range_identity(task), "start": task["start"], "end": task["end"],
+                              "status": "failed", "error": error}
+                    root = root_for(task["source_sha256"], task["key"], task["render_profile"])
+                else:
+                    result = {"key": task["key"], "generation": task["generation"],
+                              "pages": [], "errors": [{"error": error}]}
+                    root = root_for(task["source_sha256"], task["key"],
+                                    task["generation"] + task["profile"])
+                shutil.rmtree(bundle / root, ignore_errors=True)
+                results.append(result)
+        try:
+            upload_objects(bundle)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:1000]
-            if args.stage == "render":
-                result = {**range_identity(task), "start": task["start"], "end": task["end"],
-                          "status": "failed", "error": error}
-            else:
-                result = {"key": task["key"], "generation": task["generation"], "pages": [], "errors": [{"error": error}]}
-            results.append(result)
-        # Keep completed book/range metadata even if a later task times out.
-        pdf_ocr.write_json(args.output / f"results-{args.shard}.json", {"version": 1, "results": results})
+            for index, result in enumerate(results):
+                if result.get("status") == "failed" or result.get("errors"):
+                    continue
+                if args.stage == "render":
+                    results[index] = {**result, "status": "failed", "error": error}
+                else:
+                    results[index] = {"key": result["key"], "generation": result["generation"],
+                                      "pages": [], "errors": [{"error": error}]}
+    pdf_ocr.write_json(args.output / f"results-{args.shard}.json", {"version": 1, "results": results})
     return int(any(r.get("status") == "failed" or r.get("errors") for r in results))
 
 

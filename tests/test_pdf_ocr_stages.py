@@ -459,10 +459,10 @@ class PdfOcrStagesTests(unittest.TestCase):
         calls = api.return_value.sync_bucket.call_args_list
         self.assertEqual(len(calls), 2)
         production, archive = calls
-        self.assertTrue(production.args[1].endswith(str(Path(result["render_manifest"]["path"]).parent)))
-        self.assertFalse(any(path.startswith("ocr-input/") for path in production.kwargs["include"]))
-        self.assertTrue(any(path.startswith("ocr-input/") for path in archive.kwargs["include"]))
-        self.assertIn("melsm/pdf-archive", archive.args[1])
+        self.assertEqual(production.args[1], stages.BUCKET)
+        self.assertFalse(any("/ocr-input/" in path for path in production.kwargs["include"]))
+        self.assertTrue(any("/ocr-input/" in path for path in archive.kwargs["include"]))
+        self.assertEqual(archive.args[1], "hf://buckets/melsm/pdf-archive")
 
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -27,14 +28,20 @@ def _bucket_retry_delay(error: HfHubHTTPError, attempt: int) -> int:
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if retry_after:
         try:
-            return max(0, min(300, int(float(retry_after))))
+            return max(0, min(900, int(float(retry_after))))
         except (TypeError, ValueError):
             pass
-    return min(300, 5 * (2 ** attempt))
+    response_text = getattr(response, "text", "") or ""
+    match = re.search(r"retry after\s+(\d+)\s+seconds", response_text, re.IGNORECASE)
+    if not match:
+        match = re.search(r"retry after\s+(\d+)\s+seconds", str(error), re.IGNORECASE)
+    if match:
+        return min(900, int(match.group(1)))
+    return min(900, 5 * (2 ** attempt))
 
 
 def _sync_bucket_with_retry(local_dir: str, bucket: str, token: str | None,
-                            max_attempts: int = 8, include: list[str] | None = None) -> None:
+                            max_attempts: int = 15, include: list[str] | None = None) -> None:
     """Upload immutable OCR objects without turning temporary Hub throttling into a failed book."""
     for attempt in range(max_attempts):
         try:
