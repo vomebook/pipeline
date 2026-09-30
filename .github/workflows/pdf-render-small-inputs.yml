@@ -120,6 +120,7 @@ jobs:
       - name: Render and upload small PDF pages
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
         run: python scripts/pdf_ocr_stages.py render --shard "${{ matrix.shard }}"
       - uses: actions/upload-artifact@v7
         if: always()
@@ -156,6 +157,7 @@ jobs:
       - name: Publish small PDF streams
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
         run: python scripts/pdf_ocr_stages.py publish-render --results-dir output/pdf-ocr/results
       - name: Queue Reader sidecar publication in main pipeline
         env:
