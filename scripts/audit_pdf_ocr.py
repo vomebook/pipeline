@@ -14,8 +14,11 @@ import gzip
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from huggingface_hub.errors import HfHubHTTPError
 
 try:
     from . import pdf_ocr, pdf_ocr_stages
@@ -30,6 +33,26 @@ HIGH_SIGNAL_LAYOUT_FLAGS = frozenset({
     "within-block-character-order-unverified",
     "blocks-outside-explicit-regions",
 })
+
+
+def retry_hf_api(operation, attempts: int = 12):
+    """Retry manifest API calls while honoring the Hub's Retry-After header."""
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except HfHubHTTPError as exc:
+            status = pdf_ocr_stages.shared.hf_status_code(exc)
+            if status not in {408, 429, 499, 500, 502, 503, 504} or attempt + 1 == attempts:
+                raise
+            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+            try:
+                retry_after = int(headers.get("retry-after", "0"))
+            except (TypeError, ValueError):
+                retry_after = 0
+            delay = max(retry_after, min(300, 5 * 2 ** attempt))
+            print(f"temporary HF audit API failure; retry in {delay}s", flush=True)
+            time.sleep(delay)
+    raise RuntimeError("HF audit API retry limit reached")
 
 
 def non_whitespace_chars(value: str) -> int:
@@ -200,13 +223,12 @@ def select_entries(manifest: dict, *, source_repo: str = "", source_path_prefix:
 
 
 def load_manifest(api, repo: str) -> tuple[str, dict]:
-    info = pdf_ocr_stages.retry(lambda: api.repo_info(repo_id=repo, repo_type="dataset"))
-    path = pdf_ocr_stages.retry(lambda: api.hf_hub_download(
-        repo_id=repo, repo_type="dataset", filename="pdf_ocr_manifest.json", revision=info.sha))
+    path = retry_hf_api(lambda: api.hf_hub_download(
+        repo_id=repo, repo_type="dataset", filename="pdf_ocr_manifest.json", revision="main"))
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("version") != 1 or not isinstance(data.get("files"), dict):
         raise ValueError("invalid PDF OCR manifest")
-    return info.sha, data
+    return "main", data
 
 
 def load_book_manifest(entry: dict) -> dict:
