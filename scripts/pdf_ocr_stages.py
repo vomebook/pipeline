@@ -251,6 +251,17 @@ def render_partition_matches(item, partition):
     return size >= SMALL_RENDER_MAX_SOURCE_BYTES
 
 
+def filter_source_items(records, source_items):
+    if not source_items:
+        return records
+    if not isinstance(source_items, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("repo"), str)
+            or not isinstance(item.get("path"), str) for item in source_items):
+        raise ValueError("source items must be a list of repo/path objects")
+    selected = {(item["repo"], item["path"]) for item in source_items}
+    return [item for item in records if (item.get("repo"), item.get("path")) in selected]
+
+
 def ocr_lane_index(key, lane_count=OCR_LANE_COUNT):
     if type(lane_count) is not int or lane_count < 1:
         raise ValueError("OCR lane count must be a positive integer")
@@ -882,6 +893,7 @@ def main():
     parser.add_argument("--assets-repo", default="vomebook/Reader-Assets")
     parser.add_argument("--source-repo", default="")
     parser.add_argument("--source-path-prefix", default="")
+    parser.add_argument("--source-items-json", default="[]")
     parser.add_argument("--force-reprobe", action="store_true")
     args = parser.parse_args()
     api = HfApi(token=os.environ.get("HF_TOKEN"))
@@ -900,6 +912,7 @@ def main():
             if args.source_path_prefix:
                 records = [item for item in records
                            if str(item.get("path", "")).startswith(args.source_path_prefix)]
+            records = filter_source_items(records, json.loads(args.source_items_json))
             records = pending_render(records, rendered, current, args.retry_failed, args.partition,
                                      force_reprobe=args.force_reprobe)
             selected = pdf_ocr.queue(records, args.limit, args.checkpoint)

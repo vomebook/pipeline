@@ -530,6 +530,14 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertEqual(stages.pending_render(
             [large], {}, {}, partition="under16", force_reprobe=True), [large])
 
+    def test_exact_source_item_filter_matches_repo_and_path(self):
+        first = {**self.item(), "source_bytes": 10}
+        same_path_other_repo = {**first, "key": "other\\0small.pdf", "repo": "other"}
+        self.assertEqual(stages.filter_source_items(
+            [first, same_path_other_repo], [{"repo": "repo", "path": "small.pdf"}]), [first])
+        with self.assertRaises(ValueError):
+            stages.filter_source_items([first], [{"path": "small.pdf"}])
+
     def test_ocr_lanes_are_stable_and_disjoint(self):
         keys = [f"repo\\0book-{index}.pdf" for index in range(300)]
         assignments = {key: stages.ocr_lane_index(key) for key in keys}
@@ -546,6 +554,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertIn('plan-render --partition "$RENDER_BAND" --native-text-stream', small)
         self.assertIn("--source-repo", small)
         self.assertIn("--source-path-prefix", small)
+        self.assertIn("--source-items-json", small)
         self.assertIn("fonts-noto-cjk", small)
         ocr = (root / ".github/workflows/pdf-ocr-assets.yml").read_text()
         self.assertIn("--source-repo", ocr)

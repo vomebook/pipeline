@@ -27,6 +27,10 @@ on:
         description: Source path prefix filter, or blank for all
         default: ""
         type: string
+      source_items_json:
+        description: Exact source repo/path objects to render
+        default: "[]"
+        type: string
       force_reprobe:
         description: Re-probe and rebuild the selected source paths
         default: false
@@ -75,6 +79,7 @@ jobs:
           RETRY_FAILED: ${{ github.event_name == 'schedule' || inputs.retry_failed }}
           SOURCE_REPO: ${{ inputs.source_repo || '' }}
           SOURCE_PATH_PREFIX: ${{ inputs.source_path_prefix || '' }}
+          SOURCE_ITEMS_JSON: ${{ inputs.source_items_json || '[]' }}
           FORCE_REPROBE: ${{ inputs.force_reprobe || 'false' }}
         run: |
           [[ "$LIMIT" =~ ^[0-9]+$ ]] && ((10#$LIMIT >= 1 && 10#$LIMIT <= 100)) || exit 1
@@ -82,7 +87,7 @@ jobs:
           args=()
           if [[ "$RETRY_FAILED" == true ]]; then args+=(--retry-failed); fi
           if [[ "$FORCE_REPROBE" == true ]]; then args+=(--force-reprobe); fi
-          python scripts/pdf_ocr_stages.py plan-render --partition "$RENDER_BAND" --native-text-stream --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX" --limit "$LIMIT" --checkpoint 0 "${args[@]}"
+          python scripts/pdf_ocr_stages.py plan-render --partition "$RENDER_BAND" --native-text-stream --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX" --source-items-json "$SOURCE_ITEMS_JSON" --limit "$LIMIT" --checkpoint 0 "${args[@]}"
           echo "shard_count=$(jq -r '.shard_count' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
           echo "shard_ids=$(jq -c '.shard_ids' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
