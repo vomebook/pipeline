@@ -122,23 +122,34 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
     dispatch_worker = worker
     stale_items = []
     repair_render = False
+    repair_published_after_ocr = False
     if worker == "ocr" and not completed_run_id:
         ocr_endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOWS['ocr']}"
-        latest = latest_successful_run(ocr_endpoint, {
+        repo_headers = {
             "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"})
+            "X-GitHub-Api-Version": "2022-11-28"}
+        latest = latest_successful_run(ocr_endpoint, repo_headers)
+        render_endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOWS['small']}"
+        latest_render = latest_successful_run(render_endpoint, repo_headers)
+        if latest_render:
+            render_queue = completed_queue(repo, str(latest_render["id"]),
+                                           "pdf-render-small-queue", repo_headers) or {}
+            repair_published_after_ocr = (
+                render_queue.get("stale_repair") is True and
+                (not latest or latest_render.get("created_at", "") > latest.get("created_at", "")))
+            if repair_published_after_ocr:
+                # Refresh the OCR queue after a repair before selecting another batch.
+                dispatch_worker = "ocr"
         if latest:
-            queue = completed_queue(repo, str(latest["id"]), "pdf-image-ocr-queue", {
-                "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28"}) or {}
+            queue = completed_queue(repo, str(latest["id"]), "pdf-image-ocr-queue", repo_headers) or {}
             stale = queue.get("stale_render", [])
             if not isinstance(stale, list):
                 raise ValueError("invalid stale render list in OCR queue")
             stale_items = [item for item in stale if isinstance(item, dict)
                            and isinstance(item.get("repo"), str)
                            and isinstance(item.get("path"), str)][:STALE_REPAIR_BATCH_SIZE]
-            repair_render = bool(stale_items)
-            if repair_render:
+            if stale_items and not repair_published_after_ocr:
+                repair_render = True
                 dispatch_worker = "small"
     if completed_run_id:
         if not completed_run_id.isdecimal():

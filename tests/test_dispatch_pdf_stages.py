@@ -115,9 +115,37 @@ class DispatchPdfStagesTests(unittest.TestCase):
     def test_scheduled_ocr_check_prioritizes_latest_stale_repair_queue(self):
         api = FakeGitHub()
         stale = [{"repo": "source/repo", "path": f"stale-{i}.pdf"} for i in range(2)]
+        render_run = {"id": 455, "created_at": "2026-10-01T10:00:00Z"}
+        ocr_run = {"id": 456, "created_at": "2026-10-01T10:05:00Z"}
         with patch.object(controller, "urlopen", side_effect=api.open), \
-                patch.object(controller, "latest_successful_run", return_value={"id": 456}), \
-                patch.object(controller, "completed_queue", return_value={"stale_render": stale}):
+                patch.object(controller, "latest_successful_run", side_effect=[ocr_run, render_run]), \
+                patch.object(controller, "completed_queue", side_effect=[{}, {"stale_render": stale}]):
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr"))
+        self.assertEqual(api.posts[0][1], "pdf-render-small-inputs.yml/dispatches")
+        self.assertEqual(json.loads(api.posts[0][2]["inputs"]["source_items_json"]), stale)
+
+    def test_scheduled_ocr_refreshes_queue_after_newer_repair_publish(self):
+        api = FakeGitHub()
+        ocr_run = {"id": 10, "created_at": "2026-10-01T10:00:00Z"}
+        render_run = {"id": 11, "created_at": "2026-10-01T10:05:00Z"}
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "latest_successful_run", side_effect=[ocr_run, render_run]), \
+                patch.object(controller, "completed_queue", side_effect=[
+                    {"stale_repair": True}, {"stale_render": [{"repo": "r", "path": "p.pdf"}]}
+                ]):
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr"))
+        self.assertEqual(api.posts[0][1], "pdf-ocr-assets.yml/dispatches")
+
+    def test_scheduled_ocr_selects_next_stale_batch_when_ocr_is_newer(self):
+        api = FakeGitHub()
+        ocr_run = {"id": 10, "created_at": "2026-10-01T10:05:00Z"}
+        render_run = {"id": 11, "created_at": "2026-10-01T10:00:00Z"}
+        stale = [{"repo": "r", "path": "next.pdf"}]
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "latest_successful_run", side_effect=[ocr_run, render_run]), \
+                patch.object(controller, "completed_queue", side_effect=[
+                    {}, {"stale_render": stale}
+                ]):
             self.assertTrue(controller.dispatch(REPO, "token", "ocr"))
         self.assertEqual(api.posts[0][1], "pdf-render-small-inputs.yml/dispatches")
         self.assertEqual(json.loads(api.posts[0][2]["inputs"]["source_items_json"]), stale)
