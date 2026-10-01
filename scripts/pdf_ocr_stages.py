@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from huggingface_hub import HfApi, CommitOperationAdd
+from huggingface_hub import HfApi, CommitOperationAdd, batch_bucket_files
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import get_session, hf_raise_for_status
 
@@ -38,9 +38,10 @@ PROGRESS_REGISTRY = "pdf_ocr_progress.json"
 RENDER_PROGRESS_REGISTRY = "pdf_render_progress.json"
 RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
-BUCKET = "hf://buckets/vomebook/pdf-pages"
+PDF_PAGES_BUCKET = "vomebook/pdf-pages"
 PNG_ARCHIVE_BUCKET = os.environ.get("PDF_PNG_ARCHIVE_BUCKET", "melsm/pdf-archive")
 JXL_ARCHIVE_BUCKET = os.environ.get("PDF_JXL_ARCHIVE_BUCKET", "melsm/pdf-jxl")
+BUCKET_UPLOAD_BATCH_SIZE = 500
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
 RENDER_BAND_BYTES = (16 * 1024 * 1024, 32 * 1024 * 1024,
                      64 * 1024 * 1024, SMALL_RENDER_MAX_SOURCE_BYTES)
@@ -93,9 +94,16 @@ def retry(operation):
         time.sleep(delay)
 
 
+def upload_bucket_objects(bundle: Path, bucket: str, paths: list[str], token: str | None) -> None:
+    """Upload known object paths without recursively listing the destination bucket."""
+    for start in range(0, len(paths), BUCKET_UPLOAD_BATCH_SIZE):
+        batch = paths[start:start + BUCKET_UPLOAD_BATCH_SIZE]
+        additions = [(str(bundle / path), path) for path in batch]
+        retry(lambda: batch_bucket_files(bucket, add=additions, token=token))
+
+
 def upload_objects(bundle: Path) -> None:
-    """Sync one shard bundle with one transfer session per destination bucket."""
-    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    """Upload one shard's known objects without scanning any destination bucket."""
     archive_token = os.environ.get("ARCHIVE_HF_TOKEN")
     production, png, jxl = [], [], []
     objects = bundle / "objects"
@@ -112,18 +120,14 @@ def upload_objects(bundle: Path) -> None:
         else:
             production.append(relative)
     if production:
-        retry(lambda: api.sync_bucket(
-            str(bundle), BUCKET, include=sorted(production), quiet=True))
+        upload_bucket_objects(bundle, PDF_PAGES_BUCKET, sorted(production),
+                              os.environ.get("HF_TOKEN"))
     if (png or jxl) and not archive_token:
         raise RuntimeError("ARCHIVE_HF_TOKEN is required for PNG/JXL publication")
     if png:
-        retry(lambda: api.sync_bucket(
-            str(bundle), f"hf://buckets/{PNG_ARCHIVE_BUCKET}",
-            include=sorted(png), token=archive_token, quiet=True))
+        upload_bucket_objects(bundle, PNG_ARCHIVE_BUCKET, sorted(png), archive_token)
     if jxl:
-        retry(lambda: api.sync_bucket(
-            str(bundle), f"hf://buckets/{JXL_ARCHIVE_BUCKET}",
-            include=sorted(jxl), token=archive_token, quiet=True))
+        upload_bucket_objects(bundle, JXL_ARCHIVE_BUCKET, sorted(jxl), archive_token)
 
 
 def read_object(meta: dict, suffix: str | None = None) -> bytes:

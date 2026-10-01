@@ -454,15 +454,31 @@ class PdfOcrStagesTests(unittest.TestCase):
 
     def test_transfers_scope_each_book_not_whole_bucket(self):
         result = self.render_fixture()
-        with patch.object(stages, "HfApi") as api, patch.dict("os.environ", {"ARCHIVE_HF_TOKEN": "archive"}):
+        with patch.object(stages, "batch_bucket_files") as upload, patch.dict(
+                "os.environ", {"ARCHIVE_HF_TOKEN": "archive", "HF_TOKEN": "production"}):
             stages.upload_objects(self.root / "render")
-        calls = api.return_value.sync_bucket.call_args_list
+        calls = upload.call_args_list
         self.assertEqual(len(calls), 2)
         production, archive = calls
-        self.assertEqual(production.args[1], stages.BUCKET)
-        self.assertFalse(any("/ocr-input/" in path for path in production.kwargs["include"]))
-        self.assertTrue(any("/ocr-input/" in path for path in archive.kwargs["include"]))
-        self.assertEqual(archive.args[1], "hf://buckets/melsm/pdf-archive")
+        self.assertEqual(production.args[0], "vomebook/pdf-pages")
+        self.assertEqual(production.kwargs["token"], "production")
+        self.assertFalse(any("/ocr-input/" in path[1] for path in production.kwargs["add"]))
+        self.assertEqual(archive.args[0], "melsm/pdf-archive")
+        self.assertEqual(archive.kwargs["token"], "archive")
+        self.assertTrue(any("/ocr-input/" in path[1] for path in archive.kwargs["add"]))
+
+    def test_bucket_upload_batches_known_paths_without_listing(self):
+        bundle = self.root / "bundle"
+        path = bundle / "objects" / "aa" / "manifest.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"manifest")
+        with patch.object(stages, "batch_bucket_files") as upload:
+            stages.upload_bucket_objects(bundle, "vomebook/pdf-pages", [
+                "objects/aa/manifest.json"], "token")
+        upload.assert_called_once_with(
+            "vomebook/pdf-pages",
+            add=[(str(path), "objects/aa/manifest.json")],
+            token="token")
 
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}
@@ -521,10 +537,10 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertIn("--ocr-lane-index", ocr)
         small_workflow = yaml.safe_load(small)
         self.assertEqual(small_workflow[True]["workflow_dispatch"]["inputs"]["render_band"]["default"], "under16")
-        self.assertEqual(small_workflow["jobs"]["build"]["strategy"]["max-parallel"], 10)
+        self.assertEqual(small_workflow["jobs"]["build"]["strategy"]["max-parallel"], 3)
         ocr_workflow = yaml.safe_load(ocr)
         self.assertEqual(ocr_workflow[True]["workflow_dispatch"]["inputs"]["lane_index"]["default"], "0")
-        self.assertEqual(ocr_workflow["jobs"]["build"]["strategy"]["max-parallel"], 10)
+        self.assertEqual(ocr_workflow["jobs"]["build"]["strategy"]["max-parallel"], 2)
 
     def test_native_text_stream_plan_marks_pages_for_images_without_ocr(self):
         item = {**self.item(), "source_bytes": 1024}
@@ -731,19 +747,19 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertIn('default: "auto"', ocr_text)
         self.assertIn('default: "rapidocr_onnxruntime"', ocr_text)
         self.assertIn("!cancelled()", ocr["jobs"]["publish"]["if"])
-        self.assertEqual(ocr[True]["workflow_dispatch"]["inputs"]["limit"]["default"], "100")
-        self.assertIn("inputs.limit || '100'", ocr_text)
+        self.assertEqual(ocr[True]["workflow_dispatch"]["inputs"]["limit"]["default"], "20")
+        self.assertIn("inputs.limit || '20'", ocr_text)
         self.assertEqual(render["jobs"]["publish"]["concurrency"]["group"],
                          ocr["jobs"]["publish"]["concurrency"]["group"])
-        self.assertEqual(render["jobs"]["build"]["strategy"]["max-parallel"], 10)
-        self.assertEqual(ocr[True]["workflow_dispatch"]["inputs"]["target_pages"]["default"], "2000")
+        self.assertEqual(render["jobs"]["build"]["strategy"]["max-parallel"], 3)
+        self.assertEqual(ocr[True]["workflow_dispatch"]["inputs"]["target_pages"]["default"], "1000")
 
     def test_scheduled_render_drains_pending_in_webp_batches(self):
         root = Path(__file__).resolve().parents[1]
         text = (root / ".github/workflows/pdf-render-small-inputs.yml").read_text()
         workflow = yaml.safe_load(text)
         inputs = workflow[True]["workflow_dispatch"]["inputs"]
-        self.assertEqual(inputs["limit"]["default"], "100")
+        self.assertEqual(inputs["limit"]["default"], "20")
         self.assertFalse(inputs["generate_jxl"]["default"])
         self.assertEqual(workflow["env"]["PDF_JXL_ENABLED"], "${{ inputs.generate_jxl == true }}")
         self.assertIn("--checkpoint 0", text)

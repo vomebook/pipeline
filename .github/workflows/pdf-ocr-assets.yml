@@ -73,9 +73,9 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
-          LIMIT: ${{ inputs.limit || '100' }}
+          LIMIT: ${{ inputs.limit || '20' }}
           OCR_LANE_INDEX: ${{ inputs.lane_index || '0' }}
-          PDF_OCR_TARGET_PAGES_PER_SHARD: ${{ inputs.target_pages || '2000' }}
+          PDF_OCR_TARGET_PAGES_PER_SHARD: ${{ inputs.target_pages || '1000' }}
           PDF_OCR_LANG: ${{ inputs.lang || 'auto' }}
           PDF_OCR_BACKEND: ${{ inputs.backend || 'rapidocr_onnxruntime' }}
           RETRY_FAILED_ONLY: ${{ inputs.retry_failed_only || 'false' }}

@@ -70,7 +70,7 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           ARCHIVE_HF_TOKEN: ${{ secrets.ARCHIVE_HF_TOKEN }}
-          LIMIT: ${{ inputs.limit || '100' }}
+          LIMIT: ${{ inputs.limit || '20' }}
           RENDER_BAND: ${{ inputs.render_band || 'under16' }}
           RETRY_FAILED: ${{ github.event_name == 'schedule' || inputs.retry_failed }}
           SOURCE_REPO: ${{ inputs.source_repo || '' }}
