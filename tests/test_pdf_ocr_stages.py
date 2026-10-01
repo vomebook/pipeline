@@ -566,10 +566,10 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertIn("--ocr-lane-index", ocr)
         small_workflow = yaml.safe_load(small)
         self.assertEqual(small_workflow[True]["workflow_dispatch"]["inputs"]["render_band"]["default"], "under16")
-        self.assertEqual(small_workflow["jobs"]["build"]["strategy"]["max-parallel"], 3)
+        self.assertEqual(small_workflow["jobs"]["build"]["strategy"]["max-parallel"], 10)
         ocr_workflow = yaml.safe_load(ocr)
         self.assertEqual(ocr_workflow[True]["workflow_dispatch"]["inputs"]["lane_index"]["default"], "0")
-        self.assertEqual(ocr_workflow["jobs"]["build"]["strategy"]["max-parallel"], 2)
+        self.assertEqual(ocr_workflow["jobs"]["build"]["strategy"]["max-parallel"], 8)
 
     def test_native_text_stream_plan_marks_pages_for_images_without_ocr(self):
         item = {**self.item(), "source_bytes": 1024}
@@ -780,7 +780,7 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertIn("inputs.limit || '20'", ocr_text)
         self.assertEqual(render["jobs"]["publish"]["concurrency"]["group"],
                          ocr["jobs"]["publish"]["concurrency"]["group"])
-        self.assertEqual(render["jobs"]["build"]["strategy"]["max-parallel"], 3)
+        self.assertEqual(render["jobs"]["build"]["strategy"]["max-parallel"], 10)
         self.assertEqual(ocr[True]["workflow_dispatch"]["inputs"]["target_pages"]["default"], "1000")
 
     def test_scheduled_render_drains_pending_in_webp_batches(self):
