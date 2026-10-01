@@ -131,9 +131,13 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
         latest = latest_successful_run(ocr_endpoint, repo_headers)
         render_endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOWS['small']}"
         latest_render = latest_successful_run(render_endpoint, repo_headers)
+        repaired_keys = set()
         if latest_render:
             render_queue = completed_queue(repo, str(latest_render["id"]),
                                            "pdf-render-small-queue", repo_headers) or {}
+            if render_queue.get("stale_repair") is True:
+                repaired_keys = {item.get("key") for item in render_queue.get("books", [])
+                                 if isinstance(item, dict) and isinstance(item.get("key"), str)}
             repair_published_after_ocr = (
                 render_queue.get("stale_repair") is True and
                 (not latest or latest_render.get("created_at", "") > latest.get("created_at", "")))
@@ -147,7 +151,9 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
                 raise ValueError("invalid stale render list in OCR queue")
             stale_items = [item for item in stale if isinstance(item, dict)
                            and isinstance(item.get("repo"), str)
-                           and isinstance(item.get("path"), str)][:STALE_REPAIR_BATCH_SIZE]
+                           and isinstance(item.get("path"), str)
+                           and item.get("key") not in repaired_keys]
+            stale_items = stale_items[:STALE_REPAIR_BATCH_SIZE]
             if stale_items and not repair_published_after_ocr:
                 repair_render = True
                 dispatch_worker = "small"

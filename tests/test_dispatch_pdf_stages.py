@@ -150,6 +150,22 @@ class DispatchPdfStagesTests(unittest.TestCase):
         self.assertEqual(api.posts[0][1], "pdf-render-small-inputs.yml/dispatches")
         self.assertEqual(json.loads(api.posts[0][2]["inputs"]["source_items_json"]), stale)
 
+    def test_scheduled_ocr_removes_keys_from_latest_completed_repair(self):
+        api = FakeGitHub()
+        repaired = {"repo": "r", "path": "done.pdf", "key": "r\\0done.pdf"}
+        remaining = {"repo": "r", "path": "next.pdf", "key": "r\\0next.pdf"}
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "latest_successful_run", side_effect=[
+                    {"id": 10, "created_at": "2026-10-01T10:05:00Z"},
+                    {"id": 11, "created_at": "2026-10-01T10:00:00Z"}]), \
+                patch.object(controller, "completed_queue", side_effect=[
+                    {"stale_repair": True, "books": [repaired]},
+                    {"stale_render": [repaired, remaining]}]):
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr"))
+        self.assertEqual(api.posts[0][1], "pdf-render-small-inputs.yml/dispatches")
+        self.assertEqual(json.loads(api.posts[0][2]["inputs"]["source_items_json"]),
+                         [{"repo": remaining["repo"], "path": remaining["path"]}])
+
     def test_completed_repair_render_dispatches_ocr(self):
         api = FakeGitHub()
         with patch.object(controller, "urlopen", side_effect=api.open), \
