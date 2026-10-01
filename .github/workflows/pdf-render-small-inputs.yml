@@ -5,7 +5,7 @@ on:
     inputs:
       limit:
         description: Maximum pending small PDFs inspected
-        default: "100"
+        default: "20"
         type: string
       render_band:
         description: Source PDF size band assigned to this runner
@@ -98,7 +98,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 3
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shard_ids) }}
     steps:

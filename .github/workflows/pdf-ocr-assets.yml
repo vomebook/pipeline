@@ -5,7 +5,7 @@ on:
     inputs:
       limit:
         description: Maximum rendered books to process
-        default: "100"
+        default: "20"
         type: string
       lane_index:
         description: Stable OCR lane index (0-3)
@@ -13,7 +13,7 @@ on:
         type: string
       target_pages:
         description: Target actual OCR pages per worker
-        default: "2000"
+        default: "1000"
         type: string
       lang:
         description: auto or a PaddleOCR language code such as ch, en, japan, ar, fa, or ku
@@ -104,7 +104,7 @@ jobs:
     timeout-minutes: 350
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 2
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shard_ids) }}
     steps:
