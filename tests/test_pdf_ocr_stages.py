@@ -510,6 +510,12 @@ class PdfOcrStagesTests(unittest.TestCase):
         self.assertTrue(stages.render_partition_matches(at_100, "large"))
         self.assertTrue(stages.render_partition_matches(samples[0], "all"))
 
+    def test_force_reprobe_can_target_a_book_outside_the_selected_size_band(self):
+        large = {**self.item(), "source_bytes": 257_380_632}
+        self.assertEqual(stages.pending_render([large], {}, {}, partition="under16"), [])
+        self.assertEqual(stages.pending_render(
+            [large], {}, {}, partition="under16", force_reprobe=True), [large])
+
     def test_ocr_lanes_are_stable_and_disjoint(self):
         keys = [f"repo\\0book-{index}.pdf" for index in range(300)]
         assignments = {key: stages.ocr_lane_index(key) for key in keys}

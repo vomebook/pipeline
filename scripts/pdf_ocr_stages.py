@@ -261,7 +261,7 @@ def ocr_lane_index(key, lane_count=OCR_LANE_COUNT):
 def pending_render(records, rendered, ocr, retry_failed=False, partition="all", force_reprobe=False):
     pending = []
     for item in records:
-        if not render_partition_matches(item, partition):
+        if not force_reprobe and not render_partition_matches(item, partition):
             continue
         if force_reprobe:
             pending.append(item)
