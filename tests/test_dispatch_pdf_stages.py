@@ -227,6 +227,7 @@ class DispatchPdfStagesTests(unittest.TestCase):
         workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(workflow["on"]["workflow_run"], {
             "workflows": ["Render Small PDF OCR Inputs"], "types": ["completed"]})
+        self.assertIn("workflow_dispatch", workflow["on"])
         command = workflow["jobs"]["resume"]["steps"][-1]["run"]
         self.assertIn("--repair-loop", command)
 
