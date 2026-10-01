@@ -35,6 +35,10 @@ on:
         description: Re-probe and rebuild the selected source paths
         default: false
         type: boolean
+      repair_stale:
+        description: Mark this queue as an OCR stale-manifest repair batch
+        default: false
+        type: boolean
 permissions:
   contents: read
   actions: read
@@ -88,6 +92,10 @@ jobs:
           if [[ "$RETRY_FAILED" == true ]]; then args+=(--retry-failed); fi
           if [[ "$FORCE_REPROBE" == true ]]; then args+=(--force-reprobe); fi
           python scripts/pdf_ocr_stages.py plan-render --partition "$RENDER_BAND" --native-text-stream --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX" --source-items-json "$SOURCE_ITEMS_JSON" --limit "$LIMIT" --checkpoint 0 "${args[@]}"
+          if [[ "${{ inputs.repair_stale }}" == true ]]; then
+            jq '. + {stale_repair: true}' output/pdf-ocr/queue.json > output/pdf-ocr/queue.tmp
+            mv output/pdf-ocr/queue.tmp output/pdf-ocr/queue.json
+          fi
           echo "shard_count=$(jq -r '.shard_count' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
           echo "shard_ids=$(jq -c '.shard_ids' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7

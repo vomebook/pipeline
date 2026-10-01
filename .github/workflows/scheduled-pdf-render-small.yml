@@ -31,5 +31,6 @@ jobs:
           COMPLETED_RUN_ID: ${{ github.event.workflow_run.id || '' }}
           COMPLETED_CONCLUSION: ${{ github.event.workflow_run.conclusion || '' }}
           RENDER_BAND: ${{ vars.PDF_RENDER_BAND || 'under16' }}
+          OCR_LANE_INDEX: ${{ vars.PDF_OCR_LANE_INDEX || '0' }}
           UPSTREAM_GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
-        run: python3 scripts/dispatch_pdf_stages.py small --render-band "$RENDER_BAND"
+        run: python3 scripts/dispatch_pdf_stages.py small --render-band "$RENDER_BAND" --lane-index "$OCR_LANE_INDEX"

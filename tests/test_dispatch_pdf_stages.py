@@ -57,7 +57,8 @@ class DispatchPdfStagesTests(unittest.TestCase):
                            {"name": "build (0)", "conclusion": "success"}]
         api.hide_new_run = 2
         with patch.object(controller, "urlopen", side_effect=api.open), \
-                patch.object(controller.time, "sleep") as sleep:
+                patch.object(controller.time, "sleep") as sleep, \
+                patch.object(controller, "completed_queue", return_value=None):
             self.assertTrue(controller.dispatch(REPO, "token", "small", "100", "success"))
             self.assertFalse(controller.dispatch(REPO, "token", "small"))
         self.assertEqual(len(api.posts), 1)
@@ -89,9 +90,45 @@ class DispatchPdfStagesTests(unittest.TestCase):
         api = FakeGitHub()
         api.jobs["100"] = [{"name": "plan", "conclusion": "success"}] * 100 + [
             {"name": "build (100)", "conclusion": "success"}]
-        with patch.object(controller, "urlopen", side_effect=api.open):
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "completed_queue", return_value=None):
             self.assertTrue(controller.dispatch(REPO, "token", "ocr", "100", "success"))
         self.assertEqual(len(api.posts), 1)
+
+    def test_completed_ocr_dispatches_bounded_exact_stale_repair(self):
+        api = FakeGitHub()
+        stale = [{"repo": "source/repo", "path": f"book-{i}.pdf", "page_count": 9}
+                 for i in range(controller.STALE_REPAIR_BATCH_SIZE + 3)]
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "completed_queue", return_value={"stale_render": stale}), \
+                patch.object(controller, "completed_with_work", return_value=True):
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr", "100", "success"))
+        self.assertEqual(len(api.posts), 1)
+        repo, workflow, body = api.posts[0]
+        self.assertEqual(workflow, "pdf-render-small-inputs.yml/dispatches")
+        self.assertEqual(body["inputs"]["limit"], "20")
+        self.assertEqual(body["inputs"]["force_reprobe"], "true")
+        self.assertEqual(body["inputs"]["repair_stale"], "true")
+        self.assertEqual(json.loads(body["inputs"]["source_items_json"]),
+                         [{"repo": item["repo"], "path": item["path"]} for item in stale[:20]])
+
+    def test_completed_repair_render_dispatches_ocr(self):
+        api = FakeGitHub()
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "completed_queue", return_value={"stale_repair": True}), \
+                patch.object(controller, "completed_with_work", return_value=True):
+            self.assertTrue(controller.dispatch(REPO, "token", "small", "100", "success"))
+        self.assertEqual(api.posts, [(REPO, "pdf-ocr-assets.yml/dispatches",
+                                     {"ref": "main", "inputs": {"lane_index": "0"}})])
+
+    def test_repair_loop_ignores_completed_regular_render(self):
+        api = FakeGitHub()
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "completed_queue", return_value={"books": [{}]}), \
+                patch.object(controller, "completed_with_work", return_value=True):
+            self.assertFalse(controller.dispatch(
+                REPO, "token", "small", "100", "success", repair_loop=True))
+        self.assertEqual(api.posts, [])
 
     def test_ocr_waits_for_upstream_and_its_own_worker(self):
         api = FakeGitHub()
@@ -181,8 +218,17 @@ class DispatchPdfStagesTests(unittest.TestCase):
                 self.assertIn("UPSTREAM_GH_TOKEN", env)
                 if worker == "small":
                     self.assertIn("vars.PDF_RENDER_BAND", env["RENDER_BAND"])
+                    self.assertIn("vars.PDF_OCR_LANE_INDEX", env["OCR_LANE_INDEX"])
                 else:
                     self.assertIn("vars.PDF_OCR_LANE_INDEX", env["OCR_LANE_INDEX"])
+
+    def test_stale_repair_handoff_workflow_is_completion_only(self):
+        path = Path(__file__).resolve().parents[1] / ".github/workflows/resume-ocr-after-stale-render.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["on"]["workflow_run"], {
+            "workflows": ["Render Small PDF OCR Inputs"], "types": ["completed"]})
+        command = workflow["jobs"]["resume"]["steps"][-1]["run"]
+        self.assertIn("--repair-loop", command)
 
 
 if __name__ == "__main__":
