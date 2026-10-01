@@ -112,6 +112,16 @@ class DispatchPdfStagesTests(unittest.TestCase):
         self.assertEqual(json.loads(body["inputs"]["source_items_json"]),
                          [{"repo": item["repo"], "path": item["path"]} for item in stale[:20]])
 
+    def test_scheduled_ocr_check_prioritizes_latest_stale_repair_queue(self):
+        api = FakeGitHub()
+        stale = [{"repo": "source/repo", "path": f"stale-{i}.pdf"} for i in range(2)]
+        with patch.object(controller, "urlopen", side_effect=api.open), \
+                patch.object(controller, "latest_successful_run", return_value={"id": 456}), \
+                patch.object(controller, "completed_queue", return_value={"stale_render": stale}):
+            self.assertTrue(controller.dispatch(REPO, "token", "ocr"))
+        self.assertEqual(api.posts[0][1], "pdf-render-small-inputs.yml/dispatches")
+        self.assertEqual(json.loads(api.posts[0][2]["inputs"]["source_items_json"]), stale)
+
     def test_completed_repair_render_dispatches_ocr(self):
         api = FakeGitHub()
         with patch.object(controller, "urlopen", side_effect=api.open), \

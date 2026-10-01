@@ -99,6 +99,16 @@ def completed_queue(repo, run_id, artifact_name, headers):
     return queue
 
 
+def latest_successful_run(endpoint, headers):
+    payload = api_json(endpoint + "/runs?per_page=100", headers)
+    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if not isinstance(runs, list):
+        raise ValueError("invalid PDF workflow run list")
+    return next((run for run in runs if isinstance(run, dict)
+                 and run.get("status") == "completed" and run.get("conclusion") == "success"
+                 and type(run.get("id")) is int), None)
+
+
 def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
              render_band="under16", ocr_lane_index=0, upstream_token="", repair_loop=False):
     if not repo or not token or worker not in WORKFLOWS:
@@ -112,6 +122,24 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
     dispatch_worker = worker
     stale_items = []
     repair_render = False
+    if worker == "ocr" and not completed_run_id:
+        ocr_endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOWS['ocr']}"
+        latest = latest_successful_run(ocr_endpoint, {
+            "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"})
+        if latest:
+            queue = completed_queue(repo, str(latest["id"]), "pdf-image-ocr-queue", {
+                "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"}) or {}
+            stale = queue.get("stale_render", [])
+            if not isinstance(stale, list):
+                raise ValueError("invalid stale render list in OCR queue")
+            stale_items = [item for item in stale if isinstance(item, dict)
+                           and isinstance(item.get("repo"), str)
+                           and isinstance(item.get("path"), str)][:STALE_REPAIR_BATCH_SIZE]
+            repair_render = bool(stale_items)
+            if repair_render:
+                dispatch_worker = "small"
     if completed_run_id:
         if not completed_run_id.isdecimal():
             raise ValueError("invalid completed PDF worker run ID")
@@ -146,7 +174,7 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
     workflow = WORKFLOWS[dispatch_worker]
     endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}"
     previous = recent_ids(endpoint, headers)
-    targets = (repo, "anftm/pipeline") if dispatch_worker == "ocr" else (repo,)
+    targets = ((repo, "anftm/pipeline") if dispatch_worker == "ocr" else (repo,))
     for target in targets:
         target_endpoint = f"https://api.github.com/repos/{target}/actions/workflows/{workflow}"
         target_headers = headers
@@ -155,6 +183,16 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
         if is_active(target_endpoint, target_headers):
             print(f"PDF {dispatch_worker} worker already pending or active in {target}; skipping dispatch.")
             return False
+    if repair_render:
+        ocr_endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOWS['ocr']}"
+        upstream_headers = ({**headers, "Authorization": f"Bearer {upstream_token}"}
+                            if upstream_token else headers)
+        for target in (repo, "anftm/pipeline"):
+            target_headers = upstream_headers if target != repo else headers
+            if is_active(f"https://api.github.com/repos/{target}/actions/workflows/{WORKFLOWS['ocr']}",
+                         target_headers):
+                print(f"PDF stale repair waiting for OCR worker to become idle in {target}.")
+                return False
 
     if dispatch_worker == "small":
         inputs = {"render_band": render_band}
