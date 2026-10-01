@@ -602,7 +602,7 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                  retry_failed_only=False):
     if limit < 1 or target < 1:
         raise ValueError("limit and target must be positive")
-    books, tasks = [], []
+    books, tasks, stale_render = [], [], []
     for key, entry in sorted(rendered.items(), key=lambda pair: (
             current.get(pair[0], {}).get("status") == "failed", pair[0])):
         if retry_failed_only and current.get(key, {}).get("status") != "failed":
@@ -614,7 +614,16 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         options = layout_options(overrides or {}, key)
         manifest = None
         if entry["status"] != "skipped":
-            manifest = validate_render(entry, json.loads(read_object(entry["render_manifest"], "/render-manifest.json")))
+            try:
+                manifest = validate_render(
+                    entry, json.loads(read_object(entry["render_manifest"], "/render-manifest.json")))
+            except HfHubHTTPError as exc:
+                if shared.hf_status_code(exc) != 404:
+                    raise
+                stale_render.append({k: entry[k] for k in
+                                     ("key", "repo", "path", "source_bytes", "page_count", "source_kind")
+                                     if k in entry})
+                continue
         native_text = "\n".join(str(page.get("text") or "") for page in (manifest or {}).get("pages", []))
         if pdf_ocr.OCR_LANG != "auto":
             language, _, backend = pdf_ocr.resolve_ocr_config(pdf_ocr.OCR_LANG, pdf_ocr.OCR_BACKEND)
@@ -671,6 +680,7 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                                    order=lambda t: (-len(t["pages"]), t["key"], t["pages"][0]["p"])) if tasks else []
     return {"version": 1, "kind": "pdf-image-ocr-queue", "language": pdf_ocr.OCR_LANG,
             "ocr_version": pdf_ocr.OCR_VERSION, "backend": pdf_ocr.OCR_BACKEND, "books": books,
+            "stale_render": stale_render,
             "target_pages_per_shard": target, "total_ocr_pages": sum(len(t["pages"]) for t in tasks),
             "shard_count": len(shards), "shard_ids": list(range(len(shards))), "shards": shards}
 

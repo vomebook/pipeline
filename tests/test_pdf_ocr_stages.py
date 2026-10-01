@@ -480,6 +480,20 @@ class PdfOcrStagesTests(unittest.TestCase):
             add=[(str(path), "objects/aa/manifest.json")],
             token="token")
 
+    def test_ocr_plan_isolates_missing_render_manifest(self):
+        result = self.render_fixture()
+        missing = stages.HfHubHTTPError("manifest missing", response=Mock(headers={}, request=Mock()))
+        with patch.object(stages, "read_object", side_effect=missing), \
+                patch.object(stages.shared, "hf_status_code", return_value=404):
+            queue = stages.plan_images({result["key"]: result}, {}, {})
+        self.assertEqual(queue["books"], [])
+        self.assertEqual(queue["shard_count"], 0)
+        self.assertEqual(queue["stale_render"], [{
+            "key": result["key"], "repo": result["repo"], "path": result["path"],
+            "source_bytes": result["source_bytes"], "page_count": result["page_count"],
+            "source_kind": "upstream",
+        }])
+
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}
         self.assertEqual(stages.pending_render([item], {}, {}), [item])
