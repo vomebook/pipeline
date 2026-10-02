@@ -42,7 +42,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 env:
   PDF_OCR_INPUT_BUCKET: ${{ vars.PDF_OCR_INPUT_BUCKET || 'vomebook/pdf-pages' }}
@@ -181,6 +181,12 @@ jobs:
           PDF_OCR_LANG: ${{ inputs.lang || 'auto' }}
           PDF_OCR_BACKEND: ${{ inputs.backend || 'rapidocr_onnxruntime' }}
         run: python scripts/pdf_ocr_stages.py publish-ocr --results-dir output/pdf-ocr/results
+      - name: Dispatch next stale render repair batch
+        if: success() && inputs.recover_run == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/dispatch_pdf_stages.py repair-stale --queue output/pdf-ocr/queue.json
       - name: Queue Reader sidecar publication in main pipeline
         if: ${{ inputs.source_repo != '' && inputs.source_path_prefix != '' }}
         env:

@@ -41,7 +41,7 @@ on:
         type: boolean
 permissions:
   contents: read
-  actions: read
+  actions: write
 
 concurrency:
   group: ${{ format('pdf-render-small-inputs-{0}', inputs.render_band || 'under16') }}
@@ -193,3 +193,11 @@ jobs:
             --header "Content-Type: application/json" \
             --data-binary "@$RUNNER_TEMP/reader-assets-dispatch.json" \
             "https://api.github.com/repos/anftm/pipeline/actions/workflows/reader-assets.yml/dispatches"
+      - name: Resume OCR after stale render repair
+        if: ${{ success() && inputs.repair_stale == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          UPSTREAM_GH_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+          OCR_LANE_INDEX: ${{ vars.PDF_OCR_LANE_INDEX || '0' }}
+        run: python3 scripts/dispatch_pdf_stages.py resume-ocr --lane-index "$OCR_LANE_INDEX" --upstream-token "$UPSTREAM_GH_TOKEN"

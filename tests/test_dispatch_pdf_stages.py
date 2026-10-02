@@ -1,5 +1,6 @@
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -166,6 +167,25 @@ class DispatchPdfStagesTests(unittest.TestCase):
         self.assertEqual(json.loads(api.posts[0][2]["inputs"]["source_items_json"]),
                          [{"repo": remaining["repo"], "path": remaining["path"]}])
 
+    def test_publish_handoff_dispatches_next_repair_batch_directly(self):
+        api = FakeGitHub()
+        stale = [{"repo": "r", "path": f"book-{i}.pdf"} for i in range(23)]
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
+            json.dump({"stale_render": stale}, stream)
+            stream.flush()
+            with patch.object(controller, "urlopen", side_effect=api.open):
+                self.assertTrue(controller.dispatch_stale_repair(REPO, "token", stream.name))
+        self.assertEqual(api.posts[0][1], "pdf-render-small-inputs.yml/dispatches")
+        self.assertEqual(api.posts[0][2]["inputs"]["limit"], "20")
+        self.assertTrue(api.posts[0][2]["inputs"]["repair_stale"] == "true")
+
+    def test_repair_publish_handoff_dispatches_ocr(self):
+        api = FakeGitHub()
+        with patch.object(controller, "urlopen", side_effect=api.open):
+            self.assertTrue(controller.dispatch_repair_ocr(REPO, "token", lane_index=2))
+        self.assertEqual(api.posts[0][1], "pdf-ocr-assets.yml/dispatches")
+        self.assertEqual(api.posts[0][2]["inputs"], {"lane_index": "2"})
+
     def test_completed_repair_render_dispatches_ocr(self):
         api = FakeGitHub()
         with patch.object(controller, "urlopen", side_effect=api.open), \
@@ -284,6 +304,10 @@ class DispatchPdfStagesTests(unittest.TestCase):
         self.assertIn("workflow_dispatch", workflow["on"])
         command = workflow["jobs"]["resume"]["steps"][-1]["run"]
         self.assertIn("--repair-loop", command)
+        render = (Path(__file__).resolve().parents[1] / ".github/workflows/pdf-render-small-inputs.yml").read_text()
+        ocr = (Path(__file__).resolve().parents[1] / ".github/workflows/pdf-ocr-assets.yml").read_text()
+        self.assertIn("dispatch_pdf_stages.py resume-ocr", render)
+        self.assertIn("dispatch_pdf_stages.py repair-stale", ocr)
 
 
 if __name__ == "__main__":

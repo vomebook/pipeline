@@ -109,6 +109,60 @@ def latest_successful_run(endpoint, headers):
                  and type(run.get("id")) is int), None)
 
 
+def dispatch_direct(repo, token, workflow, inputs, check_targets=()):
+    if not repo or not token or workflow not in WORKFLOWS.values():
+        raise ValueError("REPO, GH_TOKEN and a valid worker workflow are required")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}"
+    previous = recent_ids(endpoint, headers)
+    for target, target_token in check_targets:
+        target_headers = {**headers, "Authorization": f"Bearer {target_token or token}"}
+        if is_active(f"https://api.github.com/repos/{target}/actions/workflows/{workflow}", target_headers):
+            print(f"PDF handoff worker already pending or active in {target}; skipping dispatch.")
+            return False
+    request = Request(endpoint + "/dispatches",
+                      data=json.dumps({"ref": "main", "inputs": inputs}).encode(),
+                      headers={**headers, "Content-Type": "application/json"}, method="POST")
+    with urlopen(request, timeout=30) as response:
+        if response.status not in (200, 204):
+            raise ValueError(f"unexpected PDF dispatch status: {response.status}")
+    for _ in range(30):
+        if recent_ids(endpoint, headers) - previous:
+            print(f"Dispatched PDF handoff {workflow} from main.")
+            return True
+        time.sleep(2)
+    raise RuntimeError("PDF handoff dispatch accepted but new run is not visible")
+
+
+def dispatch_stale_repair(repo, token, queue_path, render_band="under16"):
+    with open(queue_path, encoding="utf-8") as stream:
+        queue = json.load(stream)
+    stale = queue.get("stale_render", [])
+    if not isinstance(stale, list):
+        raise ValueError("invalid stale render list in OCR queue")
+    batch = [item for item in stale if isinstance(item, dict)
+             and isinstance(item.get("repo"), str) and isinstance(item.get("path"), str)][:20]
+    if not batch:
+        print("OCR queue has no stale render entries.")
+        return False
+    inputs = {"limit": str(len(batch)), "render_band": render_band, "retry_failed": "true",
+              "source_repo": "", "source_path_prefix": "",
+              "source_items_json": json.dumps(
+                  [{"repo": item["repo"], "path": item["path"]} for item in batch],
+                  ensure_ascii=False, separators=(",", ":")),
+              "force_reprobe": "true", "repair_stale": "true"}
+    return dispatch_direct(repo, token, WORKFLOWS["small"], inputs,
+                           check_targets=((repo, token),))
+
+
+def dispatch_repair_ocr(repo, token, lane_index=0, upstream_token=""):
+    if type(lane_index) is not int or not 0 <= lane_index < 4:
+        raise ValueError("OCR lane index must be between 0 and 3")
+    checks = [(repo, token), ("anftm/pipeline", upstream_token or token)]
+    return dispatch_direct(repo, token, WORKFLOWS["ocr"], {"lane_index": str(lane_index)}, checks)
+
+
 def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
              render_band="under16", ocr_lane_index=0, upstream_token="", repair_loop=False):
     if not repo or not token or worker not in WORKFLOWS:
@@ -240,12 +294,21 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("worker", choices=WORKFLOWS)
+    parser.add_argument("worker", choices=(*WORKFLOWS, "repair-stale", "resume-ocr"))
     parser.add_argument("--render-band", choices=("under16", "16to32", "32to64", "64to100"), default="under16")
     parser.add_argument("--lane-index", type=int, default=0)
     parser.add_argument("--repair-loop", action="store_true")
+    parser.add_argument("--queue", default="")
+    parser.add_argument("--upstream-token", default=os.environ.get("UPSTREAM_GH_TOKEN", ""))
     args = parser.parse_args()
-    dispatch(os.environ.get("REPO"), os.environ.get("GH_TOKEN"), args.worker,
-             os.environ.get("COMPLETED_RUN_ID", ""), os.environ.get("COMPLETED_CONCLUSION", ""),
-             args.render_band, args.lane_index, os.environ.get("UPSTREAM_GH_TOKEN", ""),
-             args.repair_loop)
+    repo, token = os.environ.get("REPO"), os.environ.get("GH_TOKEN")
+    if args.worker == "repair-stale":
+        if not args.queue:
+            parser.error("repair-stale requires --queue")
+        dispatch_stale_repair(repo, token, args.queue, args.render_band)
+    elif args.worker == "resume-ocr":
+        dispatch_repair_ocr(repo, token, args.lane_index, args.upstream_token)
+    else:
+        dispatch(repo, token, args.worker, os.environ.get("COMPLETED_RUN_ID", ""),
+                 os.environ.get("COMPLETED_CONCLUSION", ""), args.render_band,
+                 args.lane_index, os.environ.get("UPSTREAM_GH_TOKEN", ""), args.repair_loop)
