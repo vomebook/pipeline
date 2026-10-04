@@ -156,9 +156,22 @@ def dispatch_stale_repair(repo, token, queue_path, render_band="under16"):
                            check_targets=((repo, token),))
 
 
-def dispatch_repair_ocr(repo, token, lane_index=0, upstream_token=""):
-    if type(lane_index) is not int or not 0 <= lane_index < 4:
+def next_ocr_lane(repo, token, default_lane=0):
+    if type(default_lane) is not int or not 0 <= default_lane < 4:
         raise ValueError("OCR lane index must be between 0 and 3")
+    endpoint = f"https://api.github.com/repos/{repo}/actions/workflows/{WORKFLOWS['ocr']}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    latest = latest_successful_run(endpoint, headers)
+    if not latest:
+        return default_lane
+    queue = completed_queue(repo, str(latest["id"]), "pdf-image-ocr-queue", headers) or {}
+    lane = queue.get("ocr_lane_index")
+    return (lane + 1) % 4 if type(lane) is int and 0 <= lane < 4 else default_lane
+
+
+def dispatch_repair_ocr(repo, token, lane_index=0, upstream_token=""):
+    lane_index = next_ocr_lane(repo, token, lane_index)
     checks = [(repo, token), ("anftm/pipeline", upstream_token or token)]
     return dispatch_direct(repo, token, WORKFLOWS["ocr"], {"lane_index": str(lane_index)}, checks)
 
@@ -200,6 +213,9 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
                 dispatch_worker = "ocr"
         if latest:
             queue = completed_queue(repo, str(latest["id"]), "pdf-image-ocr-queue", repo_headers) or {}
+            lane = queue.get("ocr_lane_index")
+            if type(lane) is int and 0 <= lane < 4:
+                ocr_lane_index = (lane + 1) % 4
             stale = queue.get("stale_render", [])
             if not isinstance(stale, list):
                 raise ValueError("invalid stale render list in OCR queue")
@@ -219,6 +235,9 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
             return False
         if worker == "ocr":
             queue = completed_queue(repo, completed_run_id, "pdf-image-ocr-queue", headers) or {}
+            lane = queue.get("ocr_lane_index")
+            if type(lane) is int and 0 <= lane < 4:
+                ocr_lane_index = (lane + 1) % 4
             stale = queue.get("stale_render", [])
             if not isinstance(stale, list):
                 raise ValueError("invalid stale render list in OCR queue")

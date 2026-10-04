@@ -88,6 +88,8 @@ jobs:
           args=()
           if [[ "$RETRY_FAILED_ONLY" == true ]]; then args+=(--retry-failed-only); fi
           python scripts/pdf_ocr_stages.py plan-ocr --source-repo "$SOURCE_REPO" --source-path-prefix "$SOURCE_PATH_PREFIX" --limit "$LIMIT" --ocr-lane-index "$OCR_LANE_INDEX" "${args[@]}"
+          jq --argjson lane "$OCR_LANE_INDEX" --arg retry "$RETRY_FAILED_ONLY" ' . + {ocr_lane_index: $lane, retry_failed_only: ($retry == "true")}' output/pdf-ocr/queue.json > output/pdf-ocr/queue.tmp
+          mv output/pdf-ocr/queue.tmp output/pdf-ocr/queue.json
           echo "shard_count=$(jq -r '.shard_count' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
           echo "shard_ids=$(jq -c '.shard_ids' output/pdf-ocr/queue.json)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
