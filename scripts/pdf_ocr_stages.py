@@ -198,7 +198,11 @@ def save_registry(api, repo, name, updates, merge=None, publish_streams=False):
                 if value.get("status") == "ready":
                     previous = ocr_state["files"].get(key, {})
                     if previous.get("status") != "ready":
-                        ocr_state["files"][key] = {**value, "status": "rendered"}
+                        # Keep failed OCR books retryable after a render repair.
+                        # The refreshed render metadata is valid, but OCR still
+                        # has to rebuild the book before it can become ready.
+                        status = "failed" if previous.get("status") == "failed" else "rendered"
+                        ocr_state["files"][key] = {**value, "status": status}
                     elif (value.get("page_manifest") and same_source(previous, value)
                           and previous.get("source_sha256") == value.get("source_sha256")):
                         ocr_state["files"][key] = {**previous, "page_manifest": value["page_manifest"],

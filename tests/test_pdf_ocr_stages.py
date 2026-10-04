@@ -815,6 +815,25 @@ class PdfOcrStagesTests(unittest.TestCase):
         reader = json.loads(gzip.decompress(operations["reader_assets.json.gz"]))
         self.assertNotIn("o", reader["f"][result["key"]])
 
+    def test_render_repair_preserves_failed_ocr_status_for_retry(self):
+        result = self.render_fixture()
+        sidecar_path = self.root / "failed-reader.json.gz"
+        sidecar_path.write_bytes(gzip.compress(json.dumps({"v": 1, "f": {}}).encode()))
+        api = Mock()
+        api.repo_info.return_value.sha = "pinned-revision"
+        api.hf_hub_download.return_value = str(sidecar_path)
+        def state(_api, _repo, name, _revision):
+            if name == "pdf_ocr_manifest.json":
+                return {"version": 1, "files": {result["key"]: {"status": "failed"}}}
+            return {"version": 1, "files": {}}
+        with patch.object(stages, "load_registry", side_effect=state):
+            stages.save_registry(api, "test/repo", stages.RENDER_REGISTRY,
+                                 {result["key"]: result}, publish_streams=True)
+        operations = {op.path_in_repo: op.path_or_fileobj for op in api.create_commit.call_args.kwargs["operations"]}
+        ocr_state = json.loads(operations["pdf_ocr_manifest.json"])
+        self.assertEqual(ocr_state["files"][result["key"]]["status"], "failed")
+        self.assertEqual(ocr_state["files"][result["key"]]["render_manifest"], result["render_manifest"])
+
     def test_old_generation_progress_is_not_reused(self):
         result = self.render_fixture()
         progress = {result["key"]: {"generation": "old", "pages": {"1": {"o": "stale"}}}}
