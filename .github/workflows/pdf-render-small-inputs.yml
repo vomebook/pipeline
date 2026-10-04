@@ -87,7 +87,7 @@ jobs:
           FORCE_REPROBE: ${{ inputs.force_reprobe || 'false' }}
         run: |
           [[ "$LIMIT" =~ ^[0-9]+$ ]] && ((10#$LIMIT >= 1 && 10#$LIMIT <= 100)) || exit 1
-          [[ "$RENDER_BAND" == under16 || "$RENDER_BAND" == 16to32 || "$RENDER_BAND" == 32to64 || "$RENDER_BAND" == 64to100 ]] || exit 1
+          [[ "$RENDER_BAND" == under16 || "$RENDER_BAND" == 16to32 || "$RENDER_BAND" == 32to64 || "$RENDER_BAND" == 64to100 || "$RENDER_BAND" == under100 ]] || exit 1
           args=()
           if [[ "$RETRY_FAILED" == true ]]; then args+=(--retry-failed); fi
           if [[ "$FORCE_REPROBE" == true ]]; then args+=(--force-reprobe); fi

@@ -236,7 +236,7 @@ def render_partition_matches(item, partition):
         return True
     size = int(item.get("source_bytes") or 0)
     if not size:
-        return partition in {"small", "under16"}
+        return partition in {"small", "under16", "under100"}
     bands = {
         "under16": (0, RENDER_BAND_BYTES[0]),
         "16to32": (RENDER_BAND_BYTES[0], RENDER_BAND_BYTES[1]),
@@ -246,6 +246,8 @@ def render_partition_matches(item, partition):
     if partition in bands:
         lower, upper = bands[partition]
         return lower <= size < upper
+    if partition == "under100":
+        return size < SMALL_RENDER_MAX_SOURCE_BYTES
     if partition == "small":
         return size < SMALL_RENDER_MAX_SOURCE_BYTES
     return size >= SMALL_RENDER_MAX_SOURCE_BYTES
@@ -880,7 +882,7 @@ def main():
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--checkpoint", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true")
-    parser.add_argument("--partition", choices=("all", "small", "under16", "16to32", "32to64", "64to100", "large"), default="all")
+    parser.add_argument("--partition", choices=("all", "small", "under16", "16to32", "32to64", "64to100", "under100", "large"), default="all")
     parser.add_argument("--ocr-lane-index", type=int)
     parser.add_argument("--ocr-lane-count", type=int, default=OCR_LANE_COUNT)
     parser.add_argument("--native-text-stream", action="store_true")

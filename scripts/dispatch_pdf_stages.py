@@ -167,7 +167,7 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
              render_band="under16", ocr_lane_index=0, upstream_token="", repair_loop=False):
     if not repo or not token or worker not in WORKFLOWS:
         raise ValueError("REPO, GH_TOKEN and a valid worker are required")
-    if worker == "small" and render_band not in {"under16", "16to32", "32to64", "64to100"}:
+    if worker == "small" and render_band not in {"under16", "16to32", "32to64", "64to100", "under100"}:
         raise ValueError("invalid small PDF render band")
     if worker == "ocr" and (type(ocr_lane_index) is not int or not 0 <= ocr_lane_index < 4):
         raise ValueError("OCR lane index must be between 0 and 3")
@@ -295,7 +295,7 @@ def dispatch(repo, token, worker, completed_run_id="", completed_conclusion="",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("worker", choices=(*WORKFLOWS, "repair-stale", "resume-ocr"))
-    parser.add_argument("--render-band", choices=("under16", "16to32", "32to64", "64to100"), default="under16")
+    parser.add_argument("--render-band", choices=("under16", "16to32", "32to64", "64to100", "under100"), default="under16")
     parser.add_argument("--lane-index", type=int, default=0)
     parser.add_argument("--repair-loop", action="store_true")
     parser.add_argument("--queue", default="")

@@ -522,6 +522,9 @@ class PdfOcrStagesTests(unittest.TestCase):
                   "source_bytes": cuts[3]}
         self.assertFalse(any(stages.render_partition_matches(at_100, band) for band in bands))
         self.assertTrue(stages.render_partition_matches(at_100, "large"))
+        self.assertTrue(stages.render_partition_matches(samples[0], "under100"))
+        self.assertTrue(stages.render_partition_matches(samples[4], "under100"))
+        self.assertFalse(stages.render_partition_matches(at_100, "under100"))
         self.assertTrue(stages.render_partition_matches(samples[0], "all"))
 
     def test_force_reprobe_can_target_a_book_outside_the_selected_size_band(self):
