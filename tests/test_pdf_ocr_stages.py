@@ -509,7 +509,8 @@ class PdfOcrStagesTests(unittest.TestCase):
             first = stages.plan_images({rendered["key"]: rendered}, {}, {})
         book = first["books"][0]
         old = {key: value for key, value in book.items() if key not in {"pages", "saved"}}
-        old.update({"status": "ready", "ocr_manifest": "objects/aa/" + "a" * 64 + "/bbbbbbbbbbbbbbbb/ocr-manifest.json",
+        old.update({"status": "ready", "profile": "old-profile",
+                    "ocr_manifest": "objects/aa/" + "a" * 64 + "/bbbbbbbbbbbbbbbb/ocr-manifest.json",
                     "ocr_manifest_sha256": "b" * 64, "ocr_manifest_bytes": 1})
         progress = {book["key"]: {"generation": stages.generation_for(book),
                                   "pages": {str(page["p"]): page for page in book["pages"]}}}

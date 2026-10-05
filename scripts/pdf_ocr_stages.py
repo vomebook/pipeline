@@ -666,14 +666,14 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                  "profile": recognition_identity({**entry, "ocr_language": language, "ocr_backend": backend}, options),
                  "layout_options": options}
         old = current.get(key, {})
-        stale_ocr_manifest = False
+        stale_ocr_manifest = (old.get("status") == "ready" and bool(old.get("ocr_manifest"))
+                              and not ocr_manifest_is_available(old, entry))
         if (old.get("status") in {"ready", "skipped"} and same_source(old, entry)
                 and old.get("profile") == entry.get("profile")
                 and old.get("source_sha256") == entry.get("source_sha256")
                 and old.get("page_manifest") == entry.get("page_manifest")):
-            if old.get("status") != "ready" or not old.get("ocr_manifest") or ocr_manifest_is_available(old, entry):
+            if not stale_ocr_manifest:
                 continue
-            stale_ocr_manifest = True
             print(f"stale OCR manifest; rebuilding {key}", flush=True)
         if len(books) >= limit:
             break
