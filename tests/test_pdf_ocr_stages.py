@@ -494,6 +494,15 @@ class PdfOcrStagesTests(unittest.TestCase):
             "source_kind": "upstream",
         }])
 
+    def test_missing_ready_ocr_manifest_is_rebuilt(self):
+        entry = {"source_sha256": "a" * 64, "page_count": 1, "profile": "profile-v2"}
+        old = {"status": "ready", "source_sha256": "a" * 64, "profile": "profile-v2",
+               "ocr_manifest": "objects/aa/" + "a" * 64 + "/bbbbbbbbbbbbbbbb/ocr-manifest.json",
+               "ocr_manifest_sha256": "b" * 64, "ocr_manifest_bytes": 1}
+        missing = stages.HfHubHTTPError("manifest missing", response=Mock(headers={}, request=Mock()))
+        with patch.object(stages, "read_object", side_effect=missing):
+            self.assertFalse(stages.ocr_manifest_is_available(old, entry))
+
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}
         self.assertEqual(stages.pending_render([item], {}, {}), [item])

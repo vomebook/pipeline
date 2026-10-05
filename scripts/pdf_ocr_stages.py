@@ -615,6 +615,20 @@ def reuse_recognized_pages(old, entry, pages):
         return {}
 
 
+def ocr_manifest_is_available(old: dict, entry: dict) -> bool:
+    """Do not trust a ready sidecar after its immutable manifest disappears."""
+    try:
+        metadata = {"path": old["ocr_manifest"], "sha256": old["ocr_manifest_sha256"],
+                    "bytes": old["ocr_manifest_bytes"]}
+        manifest = json.loads(read_object(metadata, "/ocr-manifest.json"))
+        return (manifest.get("kind") == "pdf-ocr" and manifest.get("complete") is True
+                and manifest.get("source_sha256") == entry.get("source_sha256")
+                and manifest.get("profile") == old.get("profile")
+                and manifest.get("page_count") == entry.get("page_count"))
+    except (HfHubHTTPError, KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+        return False
+
+
 def plan_images(rendered, current, progress, limit=20, target=500, overrides=None,
                  retry_failed_only=False):
     if limit < 1 or target < 1:
@@ -656,7 +670,9 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                 and old.get("profile") == entry.get("profile")
                 and old.get("source_sha256") == entry.get("source_sha256")
                 and old.get("page_manifest") == entry.get("page_manifest")):
-            continue
+            if old.get("status") != "ready" or not old.get("ocr_manifest") or ocr_manifest_is_available(old, entry):
+                continue
+            print(f"stale OCR manifest; rebuilding {key}", flush=True)
         if len(books) >= limit:
             break
         if entry["status"] == "skipped":

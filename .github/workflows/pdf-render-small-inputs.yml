@@ -124,8 +124,16 @@ jobs:
         run: |
           packages=(poppler-utils fonts-noto-cjk)
           if [[ "$PDF_JXL_ENABLED" == true ]]; then packages+=(libjxl-tools); fi
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends "${packages[@]}"
+          for attempt in 1 2 3; do
+            if sudo apt-get update && sudo apt-get install -y --no-install-recommends "${packages[@]}"; then
+              break
+            fi
+            if [[ "$attempt" == 3 ]]; then
+              echo "failed to install rendering tools after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
       - uses: actions/download-artifact@v8
         with:
           name: pdf-render-small-queue
