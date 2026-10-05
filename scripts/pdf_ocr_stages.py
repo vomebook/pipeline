@@ -666,12 +666,14 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                  "profile": recognition_identity({**entry, "ocr_language": language, "ocr_backend": backend}, options),
                  "layout_options": options}
         old = current.get(key, {})
+        stale_ocr_manifest = False
         if (old.get("status") in {"ready", "skipped"} and same_source(old, entry)
                 and old.get("profile") == entry.get("profile")
                 and old.get("source_sha256") == entry.get("source_sha256")
                 and old.get("page_manifest") == entry.get("page_manifest")):
             if old.get("status") != "ready" or not old.get("ocr_manifest") or ocr_manifest_is_available(old, entry):
                 continue
+            stale_ocr_manifest = True
             print(f"stale OCR manifest; rebuilding {key}", flush=True)
         if len(books) >= limit:
             break
@@ -689,7 +691,11 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         old = current.get(key, {})
         generation = generation_for(entry)
         previous = progress.get(key, {})
-        if retry_failed_only and old.get("status") == "failed":
+        if stale_ocr_manifest:
+            # A missing manifest invalidates the saved page checkpoint too:
+            # otherwise a zero-page queue can republish the same dead path.
+            saved = {}
+        elif retry_failed_only and old.get("status") == "failed":
             # Failed books may contain progress pointing at a corrupted object.
             # Rebuild all OCR pages so assemble_book cannot reuse it again.
             saved = {}

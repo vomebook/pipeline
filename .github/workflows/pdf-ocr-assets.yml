@@ -201,7 +201,7 @@ jobs:
           test -n "${SOURCE_REPO}"
           test -n "${SOURCE_PATH_PREFIX}"
           jq -n --arg repo "$SOURCE_REPO" --arg path "$SOURCE_PATH_PREFIX" \
-            '{ref:"main",inputs:{repo:$repo,path:$path,limit:"1",checkpoint_batches:"1",bucket_migrate:true,bucket_pdf_staging:false}}' \
+            '{ref:"main",inputs:{repo:$repo,path:$path,limit:"1",checkpoint_batches:"1",bucket_migrate:true}}' \
             > "$RUNNER_TEMP/reader-assets-dispatch.json"
           curl --fail-with-body --silent --show-error -X POST \
             --header "Authorization: Bearer ${GH_TOKEN}" \

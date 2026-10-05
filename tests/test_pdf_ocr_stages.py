@@ -503,6 +503,28 @@ class PdfOcrStagesTests(unittest.TestCase):
         with patch.object(stages, "read_object", side_effect=missing):
             self.assertFalse(stages.ocr_manifest_is_available(old, entry))
 
+    def test_missing_ready_manifest_discards_saved_page_progress(self):
+        rendered = self.render_fixture()
+        with patch.object(stages, "read_object", side_effect=self.read):
+            first = stages.plan_images({rendered["key"]: rendered}, {}, {})
+        book = first["books"][0]
+        old = {key: value for key, value in book.items() if key not in {"pages", "saved"}}
+        old.update({"status": "ready", "ocr_manifest": "objects/aa/" + "a" * 64 + "/bbbbbbbbbbbbbbbb/ocr-manifest.json",
+                    "ocr_manifest_sha256": "b" * 64, "ocr_manifest_bytes": 1})
+        progress = {book["key"]: {"generation": stages.generation_for(book),
+                                  "pages": {str(page["p"]): page for page in book["pages"]}}}
+        missing = stages.HfHubHTTPError("manifest missing", response=Mock(headers={}, request=Mock()))
+
+        def read(meta, suffix=None):
+            if suffix == "/ocr-manifest.json":
+                raise missing
+            return self.read(meta, suffix)
+
+        with patch.object(stages, "read_object", side_effect=read):
+            queue = stages.plan_images({rendered["key"]: rendered}, {book["key"]: old},
+                                       lambda _keys: progress)
+        self.assertEqual(queue["total_ocr_pages"], 2)
+
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}
         self.assertEqual(stages.pending_render([item], {}, {}), [item])
