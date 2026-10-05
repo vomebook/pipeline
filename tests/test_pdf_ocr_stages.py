@@ -526,6 +526,20 @@ class PdfOcrStagesTests(unittest.TestCase):
                                        lambda _keys: progress)
         self.assertEqual(queue["total_ocr_pages"], 2)
 
+    def test_failed_ocr_discards_saved_page_progress_without_retry_flag(self):
+        rendered = self.render_fixture()
+        with patch.object(stages, "read_object", side_effect=self.read):
+            first = stages.plan_images({rendered["key"]: rendered}, {}, {})
+        book = first["books"][0]
+        old = {key: value for key, value in book.items() if key not in {"pages", "saved"}}
+        old["status"] = "failed"
+        progress = {book["key"]: {"generation": stages.generation_for(book),
+                                  "pages": {str(page["p"]): page for page in book["pages"]}}}
+        with patch.object(stages, "read_object", side_effect=self.read):
+            queue = stages.plan_images({rendered["key"]: rendered}, {book["key"]: old},
+                                       lambda _keys: progress)
+        self.assertEqual(queue["total_ocr_pages"], 2)
+
     def test_planner_includes_small_pdf_and_rebuilds_old_ocr_for_v2_index(self):
         item = {**self.item(), "source_bytes": 1024}
         self.assertEqual(stages.pending_render([item], {}, {}), [item])

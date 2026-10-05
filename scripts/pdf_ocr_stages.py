@@ -691,9 +691,10 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         old = current.get(key, {})
         generation = generation_for(entry)
         previous = progress.get(key, {})
-        if stale_ocr_manifest:
-            # A missing manifest invalidates the saved page checkpoint too:
-            # otherwise a zero-page queue can republish the same dead path.
+        if stale_ocr_manifest or old.get("status") == "failed":
+            # A missing or failed OCR result invalidates the saved page
+            # checkpoint too; otherwise a zero-page queue can republish the
+            # same dead path without recognizing anything.
             saved = {}
         elif retry_failed_only and old.get("status") == "failed":
             # Failed books may contain progress pointing at a corrupted object.
