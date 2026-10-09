@@ -57,6 +57,35 @@ def _local_name(node) -> str:
     return node.tag.rsplit("}", 1)[-1].lower() if isinstance(node.tag, str) else ""
 
 
+def _parse_package_xml(raw: bytes):
+    """Parse package XML and repair undeclared prefixes used by old EPUBs."""
+    raw = re.sub(rb"\s+xmlns:xmlns\s*=\s*(['\"])[^'\"]*\1", b"", raw,
+                 flags=re.IGNORECASE)
+    try:
+        return ET.fromstring(raw)
+    except ET.ParseError as error:
+        if "unbound prefix" not in str(error):
+            raise
+        text = raw.decode("utf-8", "replace")
+        match = re.search(r"<([A-Za-z_][\w.-]*)(?:\s[^>]*)?>", text, re.S)
+        if not match:
+            raise
+        root_tag = match.group(1)
+        declared = set(re.findall(r"xmlns:([A-Za-z_][\w.-]*)\s*=", match.group(0)))
+        used = set(re.findall(r"(?<!xmlns:)([A-Za-z_][\w.-]*):[A-Za-z_][\w.-]*", text))
+        # Namespace declaration attributes also match the prefix scanner as
+        # ``xmlns:name``. The reserved ``xmlns`` prefix must never be added.
+        missing = sorted(prefix for prefix in used
+                         if prefix not in declared and prefix not in {root_tag, "xmlns"})
+        if not missing:
+            raise
+        replacement = match.group(0)[:-1] + "".join(
+            f' xmlns:{prefix}="urn:reader-repair:{prefix}"' for prefix in missing
+        ) + ">"
+        repaired = text[:match.start()] + replacement + text[match.end():]
+        return ET.fromstring(repaired.encode("utf-8"))
+
+
 def _node_text(node) -> str:
     return re.sub(r"\s+", " ", " ".join(node.itertext())).strip()
 
@@ -167,7 +196,10 @@ def bundle_toc(entries: list[dict], records: list[dict]) -> list[dict]:
     for entry in entries:
         record = by_source.get(entry["source_path"])
         if record is None:
-            raise ValueError(f'EPUB TOC target is outside readable spine: {entry["source_path"]}')
+            # Broken packages often put cover/nav pages in the TOC without
+            # putting them in the readable spine. Preserve the actual spine
+            # and omit only the unusable navigation item.
+            continue
         if entry["source_path"] not in documents:
             try:
                 documents[entry["source_path"]] = ET.fromstring(record["clean"])
@@ -177,7 +209,9 @@ def bundle_toc(entries: list[dict], records: list[dict]) -> list[dict]:
         if _placeholder_title(title):
             title = _target_title(record["clean"], entry["fragment"], root=documents[entry["source_path"]])
         if _placeholder_title(title):
-            raise ValueError(f'EPUB TOC title cannot be recovered: {entry["source_path"]}#{entry["fragment"]}')
+            document_title = _document_title(record["clean"])
+            title = (document_title if document_title and not _placeholder_title(document_title)
+                     else f"章节 {record['index']}")
         fragment = entry["fragment"]
         root = documents.get(entry["source_path"])
         if fragment and root is not None and not any(
@@ -189,6 +223,34 @@ def bundle_toc(entries: list[dict], records: list[dict]) -> list[dict]:
         toc.append({"title": title, "chapter": record["index"],
                     "fragment": fragment, "depth": entry["depth"]})
     return toc
+
+
+def link_inline_toc(clean: str, record: dict, chapter_paths: dict[str, str],
+                    records: list[dict], toc_entries: list[dict]) -> str:
+    """Link plain paragraph TOCs found in EPUBs that omitted hrefs entirely."""
+    targets = {
+        re.sub(r"\s+", " ", str(item.get("title") or "")).strip(): chapter_paths[item["source_path"]]
+        for item in records
+        if item.get("source_path") in chapter_paths and item.get("title")
+    }
+    targets.update({
+        re.sub(r"\s+", " ", str(item.get("title") or "")).strip(): chapter_paths[item["source_path"]]
+        for item in toc_entries
+        if item.get("source_path") in chapter_paths and item.get("title")
+    })
+    if (len(targets) < 2 or re.search(r"<a\b", clean, re.I)
+            or not ("目录" in record.get("title", "")
+                    or sum(clean.count(html.escape(title)) for title in targets) >= 2)):
+        return clean
+    paragraph = re.compile(r"(<(?:html:)?p\b[^>]*>)(\s*)([^<]+?)(\s*)(</(?:html:)?p>)", re.I)
+    def replace(match):
+        title = re.sub(r"\s+", " ", match.group(3)).strip()
+        target = targets.get(title)
+        if not target:
+            return match.group(0)
+        return (f'{match.group(1)}{match.group(2)}<a href="{html.escape(target, quote=True)}">'
+                f'{match.group(3)}</a>{match.group(4)}{match.group(5)}')
+    return paragraph.sub(replace, clean)
 
 
 def _can_share_resource(path: str) -> bool:
@@ -251,7 +313,7 @@ def _chapter_text(document: str) -> str:
 
 
 def build_bundle(epub: Path, output: Path, *, fallback: str | None = None,
-                 include_resources: bool = True) -> dict:
+                 include_resources: bool = True, include_all_documents: bool = False) -> dict:
     """Write chapter files and return the validated manifest.
 
     The output directory contains only files intended for a dataset commit.
@@ -259,12 +321,12 @@ def build_bundle(epub: Path, output: Path, *, fallback: str | None = None,
     output.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(epub) as archive:
         names = set(archive.namelist())
-        container = ET.fromstring(archive.read("META-INF/container.xml"))
+        container = _parse_package_xml(archive.read("META-INF/container.xml"))
         rootfile = next((node for node in container.iter() if _local_name(node) == "rootfile"), None)
         if rootfile is None:
             raise ValueError("EPUB package is missing")
         opf_path = rootfile.attrib.get("full-path", "")
-        opf = ET.fromstring(archive.read(opf_path))
+        opf = _parse_package_xml(archive.read(opf_path))
         base = posixpath.dirname(opf_path)
         manifest = {}
         for node in opf.iter():
@@ -279,12 +341,26 @@ def build_bundle(epub: Path, output: Path, *, fallback: str | None = None,
         for entry in toc_entries:
             if not _placeholder_title(entry["title"]):
                 toc_titles.setdefault(entry["source_path"], entry["title"])
-        for number, ref in enumerate((n for n in opf.iter() if _local_name(n) == "itemref"), 1):
-            item = manifest.get(ref.attrib.get("idref"))
-            if (not item or "nav" in item.get("properties", "").split()
-                    or item.get("media-type", "").lower() not in {"application/xhtml+xml", "text/html"}):
+        document_items = {
+            _zip_path(base, item.get("href", "")): item
+            for item in manifest.values()
+            if "nav" not in item.get("properties", "").split()
+            and item.get("media-type", "").lower() in {"application/xhtml+xml", "text/html"}
+        }
+        spine_paths = []
+        for ref in opf.iter():
+            if _local_name(ref) != "itemref":
                 continue
-            source_path = _zip_path(base, item.get("href", ""))
+            item = manifest.get(ref.attrib.get("idref"))
+            if not item or "nav" in item.get("properties", "").split():
+                continue
+            candidate = _zip_path(base, item.get("href", ""))
+            if candidate in document_items:
+                spine_paths.append(candidate)
+        document_paths = spine_paths + ([path for path in sorted(document_items) if path not in spine_paths]
+                                         if include_all_documents else [])
+        for number, source_path in enumerate(document_paths, 1):
+            item = document_items[source_path]
             if source_path not in names:
                 # Keep readable chapters when a broken package has one stale spine entry.
                 continue
@@ -342,6 +418,7 @@ def build_bundle(epub: Path, output: Path, *, fallback: str | None = None,
                 return f'{match.group(1)}="{html.escape(target, quote=True)}"'
             clean = re.sub(r'(?<![\w:-])(href)\s*=\s*["\']([^"\']*)["\']',
                            rewrite_chapter_link, clean, flags=re.I)
+            clean = link_inline_toc(clean, record, chapter_paths, chapter_records, toc_entries)
             resources = record["resources"]
             if include_resources:
                 resource_bytes = sum(archive.getinfo(resource).file_size for resource in resources)

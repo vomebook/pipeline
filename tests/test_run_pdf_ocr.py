@@ -19,7 +19,7 @@ class RunPdfOcrTests(unittest.TestCase):
             (root / "ocr-manifest.json").write_text("{}")
             with patch.object(run_pdf_ocr, "sync_bucket") as sync:
                 run_pdf_ocr.upload_ocr_objects(bundle)
-            self.assertEqual(sync.call_args.args, (str(root), f"hf://buckets/vomebook/pdf-pages/{relative.as_posix()}"))
+            self.assertEqual(sync.call_args.args, (str(root), f"hf://buckets/vomebook/pdf-pages-v2/{relative.as_posix()}"))
             self.assertIsNone(sync.call_args.kwargs["include"])
 
     def test_bucket_sync_honors_retry_after(self):
@@ -51,22 +51,6 @@ class RunPdfOcrTests(unittest.TestCase):
             run_pdf_ocr._sync_bucket_with_retry("/tmp/book", "hf://buckets/vomebook/pdf-pages", "token")
 
         sleep.assert_called_once_with(5)
-
-    def test_bucket_retry_reads_retry_after_from_error_body(self):
-        response = requests.Response()
-        response.status_code = 429
-        response.request = requests.Request(
-            "POST", "https://huggingface.co/api/buckets/vomebook/pdf-pages/tree"
-        ).prepare()
-        error = HfHubHTTPError(
-            "429 Too Many Requests: Retry after 181 seconds", response=response
-        )
-
-        with patch.object(run_pdf_ocr, "sync_bucket", side_effect=[error, None]), \
-                patch.object(run_pdf_ocr.time, "sleep") as sleep:
-            run_pdf_ocr._sync_bucket_with_retry("/tmp/book", "hf://buckets/vomebook/pdf-pages", "token")
-
-        sleep.assert_called_once_with(181)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ import copy
 import re
 import statistics
 
-VERSION = "layout-v2"
+VERSION = "layout-v1"
 MODES = {"auto", "horizontal-ltr", "horizontal-rtl", "vertical-rl", "vertical-lr"}
 
 
@@ -57,22 +57,9 @@ def physical_ratio(block, width, height):
 
 
 def infer_mode(blocks, width, height):
-    substantial = [b for b in blocks
-                   if len(b["t"].strip()) >= 3 and b["b"][2] > b["b"][0] and b["b"][3] > b["b"][1]]
-    candidates = [b for b in substantial
-                  if physical_ratio(b, width, height) < .6
-                  and b["b"][3] - b["b"][1] >= .12
-                  and b["b"][2] - b["b"][0] <= .25]
-    # A narrow block is not enough evidence: horizontal OCR can fragment words
-    # into narrow boxes. Require two tall columns with meaningful vertical
-    # overlap before inferring traditional right-to-left reading order.
-    for left in candidates:
-        for right in candidates:
-            if right is left or abs(right["b"][0] - left["b"][0]) < .15:
-                continue
-            overlap = min(left["b"][3], right["b"][3]) - max(left["b"][1], right["b"][1])
-            if overlap >= .12:
-                return "vertical-rl", "geometry"
+    substantial = [b for b in blocks if len(b["t"].strip()) >= 3]
+    if substantial and sum(physical_ratio(b, width, height) < .6 for b in substantial) / len(substantial) >= .75:
+        return "vertical-rl", "geometry"
     return "horizontal-ltr", "default"
 
 
@@ -96,18 +83,6 @@ def groups(blocks, mode, width, height, depth=0):
         return []
     vertical = mode.startswith("vertical")
     if vertical:
-        # Separate repeated vertical panels before grouping columns. A page
-        # can contain two stacked panels with the same x columns; merging them
-        # first interleaves the panels in reading order.
-        if depth < 12 and len(blocks) > 3:
-            median_width = statistics.median(max(1e-6, b["b"][2] - b["b"][0]) for b in blocks)
-            cut = gap_split(blocks, 1, max(.012, .5 * median_width))
-            if cut:
-                first, second = cut
-                first_columns = {round((b["b"][0] + b["b"][2]) / 2, 2) for b in first}
-                second_columns = {round((b["b"][0] + b["b"][2]) / 2, 2) for b in second}
-                if len(first_columns) > 1 and len(second_columns) > 1:
-                    return [g for part in cut for g in groups(part, mode, width, height, depth + 1)]
         # Group tall/single-character fragments sharing a column; do not read
         # a row across adjacent vertical columns.
         columns = []

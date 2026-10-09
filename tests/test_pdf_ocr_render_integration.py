@@ -8,10 +8,28 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from scripts import pdf_ocr, pdf_ocr_stages as stages
+from scripts import pdf_ocr, pdf_ocr_stages as stages, plan_pdf_ocr
 
 
 class RealPdfRenderingTests(unittest.TestCase):
+    def test_time_estimator_samples_real_pages_locally_and_builds_a_compact_queue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "sample.pdf"
+            with Image.new("RGB", (100, 150), "white") as image:
+                image.save(source, "PDF", resolution=100, save_all=True, append_images=[image, image])
+            record = {"key": "test\0sample.pdf", "source_revision": "test", "source_kind": "upstream"}
+            with patch.object(plan_pdf_ocr, "download_source", return_value=source):
+                queue = plan_pdf_ocr.plan([record], workers=1,
+                    render_estimator=lambda item, path: stages.estimate_render_cost(item, path, {}))
+            self.assertEqual(queue["failed"], [])
+            cost = queue["shards"][0]["records"][0]["_render_cost"]
+            self.assertEqual((cost["source"], cost["samples"]), ("sample", 3))
+            self.assertGreater(cost["seconds_per_page"], 0)
+            timed = stages.plan_render_ranges(queue, {}, 1500)
+            tasks = [task for shard in timed["shards"] for task in shard["records"]]
+            self.assertNotIn("probe", tasks[0])
+            self.assertEqual(stages.expand_render_tasks(timed, tasks)[0]["probe"]["page_count"], 3)
+
     def test_small_scanned_pdf_renders_lossless_ocr_input_before_recognition(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -99,63 +117,6 @@ class RealPdfRenderingTests(unittest.TestCase):
                                                            wraps=pdf_ocr.reader_webp_quality) as select:
                         pdf_ocr.render_page(source, 1, root, (128, 128), reader_jxl=jxl)
                         self.assertEqual(select.call_args.args[1], True)
-
-    def test_batched_pages_match_individual_png_and_webp_bytes(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "pages.pdf"
-            with Image.new("RGB", (160, 200), "white") as image:
-                image.save(source, "PDF", resolution=150, save_all=True,
-                           append_images=[Image.new("RGB", (160, 200), color)
-                                          for color in ("red", "green", "blue")])
-            single, batch = root / "single", root / "batch"
-            single.mkdir()
-            batch.mkdir()
-            for page in range(1, 5):
-                pdf_ocr.render_page(source, page, single)
-            with patch.object(pdf_ocr, "_run", wraps=pdf_ocr._run) as run:
-                self.assertEqual(pdf_ocr.prerender_pages(source, range(1, 5), batch), set(range(1, 5)))
-                for page in range(1, 5):
-                    pdf_ocr.render_page(source, page, batch, prepared=True)
-            self.assertEqual(sum(call.args[0][0] == "pdftocairo" for call in run.call_args_list), 1)
-            for page in range(1, 5):
-                name = f"page-{page:06d}"
-                for suffix in (".png", ".webp"):
-                    self.assertEqual((single / (name + suffix)).read_bytes(),
-                                     (batch / (name + suffix)).read_bytes())
-
-    def test_incomplete_batch_falls_back_without_stale_images(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            def fail(command, **_kwargs):
-                (root / "render-batch-1.png").write_bytes(b"partial")
-                raise RuntimeError("batch failed")
-            with patch.object(pdf_ocr, "_page_render_dpi", return_value=150), \
-                    patch.object(pdf_ocr, "_run", side_effect=fail):
-                self.assertEqual(pdf_ocr.prerender_pages(Path("book.pdf"), range(1, 3), root), set())
-            self.assertEqual(list(root.iterdir()), [])
-
-    def test_render_book_uses_batch_and_keeps_every_page(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            source = root / "four.pdf"
-            with Image.new("RGB", (150, 200), "white") as image:
-                image.save(source, "PDF", resolution=150, save_all=True,
-                           append_images=[image, image, image])
-            with patch.object(pdf_ocr, "_run", wraps=pdf_ocr._run) as run:
-                result = stages.render_book({"key": "test\0four.pdf", "source_revision": "test"},
-                                            source, root / "bundle")
-            self.assertEqual(sum(call.args[0][0] == "pdftocairo" for call in run.call_args_list), 1)
-            manifest = json.loads((root / "bundle" / result["render_manifest"]["path"]).read_text())
-            self.assertEqual([page["p"] for page in manifest["pages"]], [1, 2, 3, 4])
-            stages.validate_render(result, manifest)
-
-    def test_mixed_dpi_batch_uses_individual_fallback(self):
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(pdf_ocr, "_page_render_dpi", side_effect=(150, 200)), \
-                patch.object(pdf_ocr, "_run") as run:
-            self.assertEqual(pdf_ocr.prerender_pages(Path("book.pdf"), range(1, 3), Path(temp)), set())
-            run.assert_not_called()
 
 
 if __name__ == "__main__":

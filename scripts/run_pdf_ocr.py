@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -17,9 +16,12 @@ from huggingface_hub import hf_hub_download, sync_bucket
 from huggingface_hub.errors import HfHubHTTPError
 
 try:
-    from . import pdf_ocr
+    from . import pdf_ocr, shared
+    from .reader_bucket import materialize as materialize_bucket
 except ImportError:
     import pdf_ocr
+    import shared
+    from reader_bucket import materialize as materialize_bucket
 
 
 def _bucket_retry_delay(error: HfHubHTTPError, attempt: int) -> int:
@@ -28,20 +30,14 @@ def _bucket_retry_delay(error: HfHubHTTPError, attempt: int) -> int:
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if retry_after:
         try:
-            return max(0, min(900, int(float(retry_after))))
+            return max(0, min(300, int(float(retry_after))))
         except (TypeError, ValueError):
             pass
-    response_text = getattr(response, "text", "") or ""
-    match = re.search(r"retry after\s+(\d+)\s+seconds", response_text, re.IGNORECASE)
-    if not match:
-        match = re.search(r"retry after\s+(\d+)\s+seconds", str(error), re.IGNORECASE)
-    if match:
-        return min(900, int(match.group(1)))
-    return min(900, 5 * (2 ** attempt))
+    return min(300, 5 * (2 ** attempt))
 
 
 def _sync_bucket_with_retry(local_dir: str, bucket: str, token: str | None,
-                            max_attempts: int = 15, include: list[str] | None = None) -> None:
+                            max_attempts: int = 8, include: list[str] | None = None) -> None:
     """Upload immutable OCR objects without turning temporary Hub throttling into a failed book."""
     for attempt in range(max_attempts):
         try:
@@ -67,7 +63,7 @@ def upload_ocr_objects(bundle: Path) -> None:
     """Scope remote listings to each local book/profile, not the whole Bucket."""
     for root in sorted((bundle / "objects").glob("*/*/*")):
         if root.is_dir():
-            destination = f"hf://buckets/vomebook/pdf-pages/{root.relative_to(bundle).as_posix()}"
+            destination = f"hf://buckets/{shared.PDF_PAGES_BUCKET}/{root.relative_to(bundle).as_posix()}"
             _sync_bucket_with_retry(str(root), destination, os.environ.get("HF_TOKEN"))
 
 
@@ -75,6 +71,9 @@ def source_path(item: dict) -> Path:
     for attempt in range(6):
         try:
             if item.get("source_kind") == "generated":
+                if item.get("reader_assets_bucket") and item.get("reader_assets_path"):
+                    return materialize_bucket(item["reader_assets_path"], os.environ.get("HF_TOKEN"), ".pdf",
+                                              bucket=item["reader_assets_bucket"])
                 return Path(hf_hub_download(
                     item["reader_assets_repo"], item["reader_assets_path"], repo_type="dataset",
                     revision=item["reader_assets_revision"], token=os.environ.get("HF_TOKEN")))

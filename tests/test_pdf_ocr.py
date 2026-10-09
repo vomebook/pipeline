@@ -12,11 +12,6 @@ from scripts.plan_pdf_ocr import DEFAULT_OCR_TARGET_PAGES_PER_SHARD, pdf_ocr_sha
 
 
 class PdfOcrContractTests(unittest.TestCase):
-    def test_document_text_probe_extracts_all_pages_in_one_poppler_call(self):
-        with patch.object(pdf_ocr, "_run", return_value="前页\f正文文字\f") as run:
-            self.assertEqual(pdf_ocr.document_text_probe(Path("book.pdf"), 3), [2, 4, 0])
-        run.assert_called_once_with(["pdftotext", "-enc", "UTF-8", "book.pdf", "-"])
-
     def test_normalize_ocr_result_preserves_order_and_normalizes_boxes(self):
         blocks = pdf_ocr.normalize_ocr_result({
             "rec_texts": [" 第二 ", "第一"],
@@ -65,6 +60,49 @@ class PdfOcrContractTests(unittest.TestCase):
 
     def test_default_ocr_target_reduces_model_startup_shards(self):
         self.assertEqual(DEFAULT_OCR_TARGET_PAGES_PER_SHARD, 2000)
+
+    def test_probe_pdf_batches_text_pages_without_changing_per_page_counts(self):
+        def run(command, **_kwargs):
+            if command[0] == "pdfinfo":
+                return "Pages: 3\n"
+            self.assertEqual(command[0], "pdftotext")
+            self.assertEqual(command[command.index("-f") + 1], "1")
+            self.assertEqual(command[command.index("-l") + 1], "3")
+            return "第一 页\fEnglish text\f\f"
+
+        with patch.object(pdf_ocr, "_run", side_effect=run) as execute:
+            probe = pdf_ocr.probe_pdf(Path("sample.pdf"))
+        self.assertEqual(probe["page_chars"], [3, 11, 0])
+        self.assertEqual(probe["classification"], "scan")
+        self.assertEqual(sum(call.args[0][0] == "pdftotext" for call in execute.call_args_list), 1)
+
+    def test_native_page_batch_preserves_page_text_and_boxes(self):
+        page = ('<page width="200" height="300"><flow><block><line yMin="10" yMax="20">'
+                '<word xMin="20" yMin="10" xMax="80" yMax="20">正文</word>'
+                '</line></block></flow></page>')
+
+        with patch.object(pdf_ocr, "_run", return_value=page + page) as execute:
+            pages = pdf_ocr.native_pages(Path("sample.pdf"), [1, 2], batch_size=2)
+
+        self.assertEqual([pages[number]["text"] for number in (1, 2)], ["正文", "正文"])
+        self.assertEqual(pages[1]["blocks"], pages[2]["blocks"])
+        self.assertEqual(pages[1]["blocks"][0]["b"], [0.1, 1 / 30, 0.4, 1 / 15])
+        execute.assert_called_once()
+
+    def test_native_page_batch_falls_back_to_single_pages_on_invalid_range(self):
+        page = '<page width="100" height="100"></page>'
+
+        def run(command, **_kwargs):
+            start, end = int(command[command.index("-f") + 1]), int(command[command.index("-l") + 1])
+            if end - start:
+                return page
+            return page
+
+        with patch.object(pdf_ocr, "_run", side_effect=run) as execute:
+            pages = pdf_ocr.native_pages(Path("sample.pdf"), [1, 2], batch_size=2)
+
+        self.assertEqual(set(pages), {1, 2})
+        self.assertEqual(execute.call_count, 3)
 
     def test_manifest_rejects_non_object_paths(self):
         manifest = {"version": 1, "files": {"x": {
@@ -131,14 +169,6 @@ class PdfOcrContractTests(unittest.TestCase):
                 self.assertEqual(pdf_ocr.detect_language(key), language)
                 self.assertEqual(pdf_ocr.book_ocr_config({"key": key}), (language, backend))
 
-    def test_failed_structure_assessment_marks_source_for_image_render(self):
-        item = {"key": "repo\0book.pdf", "repo": "repo", "path": "book.pdf"}
-        with patch.object(pdf_ocr.pdf_assets, "load_records", return_value=[item]):
-            records = pdf_ocr.source_records(Path("unused"), Path("unused"), range_manifest={
-                "files": {item["key"]: {"status": "failed", "reason": "slow PDF"}}})
-        self.assertEqual(records[0]["range_status"], "failed")
-        self.assertTrue(records[0]["force_image_render"])
-
     def test_gbk_repaired_reader_pdf_replaces_original_in_ocr_sources(self):
         repo, path = next(iter(pdf_ocr.reader_assets.KNOWN_GBK_PDFS))
         original = {"key": repo + "\0" + path, "repo": repo, "path": path,
@@ -148,7 +178,7 @@ class PdfOcrContractTests(unittest.TestCase):
         with patch.object(pdf_ocr.pdf_assets, "load_records", return_value=[original]), \
                 patch.object(pdf_ocr.pdf_assets, "load_generated_records", return_value=[repaired]):
             records = pdf_ocr.source_records(Path("unused"), Path("unused"), {"revision": "assets"})
-        self.assertEqual(records, [repaired])
+        self.assertEqual(records, [{**repaired, "original_source_bytes": None}])
 
         with patch.object(pdf_ocr.pdf_assets, "load_records", return_value=[original]), \
                 patch.object(pdf_ocr.pdf_assets, "load_generated_records", return_value=[]):

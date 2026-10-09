@@ -34,9 +34,9 @@ class EpubTocTests(unittest.TestCase):
         self.assertEqual(result['toc'], [dict(title='日记', chapter=1, fragment='day', depth=0),
                                          dict(title='一月三日', chapter=1, fragment='day', depth=1)])
 
-    def test_unrecoverable_navigation_fails_instead_of_publishing_placeholder(self):
-        with self.assertRaisesRegex(ValueError, 'cannot be recovered'):
-            self.build('<ncx><navMap><navPoint><navLabel><text>Unknown Text</text></navLabel><content src="book.xhtml#missing"/></navPoint></navMap></ncx>')
+    def test_unrecoverable_navigation_uses_a_stable_fallback_title(self):
+        result = self.build('<ncx><navMap><navPoint><navLabel><text>Unknown Text</text></navLabel><content src="book.xhtml#missing"/></navPoint></navMap></ncx>')
+        self.assertEqual(result['toc'][0]['title'], '章节 1')
 
     def test_missing_navigation_fragment_falls_back_to_chapter_start(self):
         result = self.build('<ncx><navMap><navPoint><navLabel><text>第一卷</text></navLabel><content src="book.xhtml#missing"/></navPoint></navMap></ncx>')
@@ -47,6 +47,25 @@ class EpubTocTests(unittest.TestCase):
         result['toc'] = [dict(title='错误', chapter=3, depth=0, fragment='')]
         with self.assertRaisesRegex(ValueError, 'TOC entry'):
             reader_assets.validate_chapter_manifest(result)
+
+    def test_plain_directory_paragraphs_link_to_matching_chapters(self):
+        navigation = '<ncx><navMap><navPoint><navLabel><text>第一篇</text></navLabel><content src="book.xhtml"/></navPoint><navPoint><navLabel><text>第二篇</text></navLabel><content src="split.xhtml"/></navPoint></navMap></ncx>'
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / 'book.epub'
+        with zipfile.ZipFile(source, 'w') as archive:
+            archive.writestr('META-INF/container.xml', '<container><rootfiles><rootfile full-path="O/content.opf"/></rootfiles></container>')
+            archive.writestr('O/content.opf', '<package><manifest><item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="a" href="book.xhtml" media-type="application/xhtml+xml"/><item id="b" href="split.xhtml" media-type="application/xhtml+xml"/></manifest><spine toc="toc"><itemref idref="a"/><itemref idref="b"/></spine></package>')
+            archive.writestr('O/toc.ncx', navigation)
+            archive.writestr('O/book.xhtml', '<html><body><h1>目录</h1><p>第一篇</p><p>第二篇</p><p>没有匹配</p></body></html>')
+            archive.writestr('O/split.xhtml', '<html><body><h1>第二篇</h1><p>正文</p></body></html>')
+        bundle = root / 'bundle'
+        epub_chapters.build_bundle(source, bundle)
+        text = (bundle / 'chapters/chapter-0001.xhtml').read_text(encoding='utf-8')
+        self.assertIn('href="chapter-0001.xhtml"', text)
+        self.assertIn('href="chapter-0002.xhtml"', text)
+        self.assertIn('>没有匹配</', text)
 
 
 if __name__ == '__main__':

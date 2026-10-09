@@ -4,9 +4,12 @@
 import argparse
 import concurrent.futures
 import base64
+import copy
+import csv
 import email.policy
 import hashlib
 import html
+import io
 import mimetypes
 import json
 import re
@@ -20,6 +23,7 @@ import http.client
 import urllib.error
 import urllib.request
 import urllib.parse
+import warnings
 import zipfile
 import os
 import posixpath
@@ -27,6 +31,7 @@ import xml.etree.ElementTree as ET
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from pathlib import Path
+from lxml import html as lxml_html
 
 import bleach
 import tinycss2
@@ -36,13 +41,17 @@ from PIL import Image, ImageSequence
 
 try:
     from .reader_assets import (
-        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
-        object_profile_path, reusable_object_key, source_password, validate_object_path,
+        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, NATIVE_MEDIA_PROFILE,
+        SPREADSHEET_HTML_PROFILE,
+        PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
+        object_profile_path, reusable_object_key, source_password, validate_storage_path,
     )
 except ImportError:
     from reader_assets import (
-        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
-        object_profile_path, reusable_object_key, source_password, validate_object_path,
+        EPUB_CHAPTER_BUNDLE_DIR, EPUB_CHAPTER_PROFILE, GBK_PDF_CONTRACT, NATIVE_MEDIA_PROFILE,
+        SPREADSHEET_HTML_PROFILE,
+        PASSWORD_RE, canonical_json, load_json, needs_epub_chapters,
+        object_profile_path, reusable_object_key, source_password, validate_storage_path,
     )
 
 try:
@@ -51,6 +60,9 @@ except ImportError:
     import shared
 
 MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_READER_IMAGE_PIXELS = 300_000_000
+MAX_READER_IMAGE_EDGE = 16_000
+READER_IMAGE_LOCK = threading.Lock()
 MAX_HTML_RESOURCE_BYTES = 16 * 1024 * 1024
 MAX_HTML_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_HTML_RESOURCES = 64
@@ -86,6 +98,11 @@ CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 OLE_SIGNATURE = bytes.fromhex("d0cf11e0a1b11ae1")
 MIN_PAGE_CONTENT_RATIO = 0.0005
 COMMAND_TIMEOUT_SECONDS = int(os.environ.get("READER_CONVERSION_COMMAND_TIMEOUT", "120"))
+SPREADSHEET_RENDER_COMMAND_TIMEOUT_SECONDS = max(
+    1800, int(os.environ.get("READER_SPREADSHEET_RENDER_TIMEOUT", str(COMMAND_TIMEOUT_SECONDS)))
+)
+SPREADSHEET_FULL_PAGE_MAX_PIXELS = 24_000_000
+SPREADSHEET_FULL_PAGE_MAX_EDGE = 16_000
 EPUB_COMMAND_TIMEOUT_SECONDS = max(1800, int(os.environ.get(
     "READER_EPUB_COMMAND_TIMEOUT", str(COMMAND_TIMEOUT_SECONDS),
 )))
@@ -109,7 +126,9 @@ ARTIFACT_LOCKS_GUARD = threading.Lock()
 
 
 def download_source(url: str, target: Path, *, max_bytes: int = MAX_SOURCE_BYTES) -> tuple[str, int]:
-    for attempt in range(3):
+    # HF resolve URLs can briefly return 404 while a dataset revision is
+    # propagating. Do not resume a stale partial file after that response.
+    for attempt in range(5):
         offset = target.stat().st_size if target.exists() else 0
         headers = {"User-Agent": "VoiceOfML-Reader-Assets/1.0"}
         if offset:
@@ -146,12 +165,14 @@ def download_source(url: str, target: Path, *, max_bytes: int = MAX_SOURCE_BYTES
                         output.write(chunk)
             return digest.hexdigest(), size
         except urllib.error.HTTPError as exc:
-            if exc.code not in {408, 429} and exc.code < 500:
+            if exc.code == 404:
+                target.unlink(missing_ok=True)
+            elif exc.code not in {408, 429} and exc.code < 500:
                 raise
             error = exc
         except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
             error = exc
-        if attempt == 2:
+        if attempt == 4:
             raise error
         time.sleep(attempt + 1)
     raise RuntimeError("source download retry limit reached")
@@ -423,6 +444,22 @@ def download_existing(url: str, target: Path, expected_sha256: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def is_remote_not_found(error: Exception) -> bool:
+    """Whether a reusable dataset object disappeared and can be rebuilt."""
+    status = getattr(error, "code", None)
+    response = getattr(error, "response", None)
+    if status in {404, 410, "404", "410"}:
+        return True
+    if isinstance(response, dict):
+        if response.get("status_code") in {404, 410}:
+            return True
+        if response.get("Error", {}).get("Code") in {"404", "410", "NotFound", "NoSuchKey"}:
+            return True
+        if response.get("ResponseMetadata", {}).get("HTTPStatusCode") in {404, 410}:
+            return True
+    return False
+
+
 def file_sha256(path: Path) -> str:
     return shared.hash_file(path)[0]
 
@@ -533,6 +570,70 @@ def validate_media_output(path: Path, reader_mode: str) -> None:
             or not 0 < width <= 1920 or not 0 < height <= 1080
             or (audio and audio[0].get("codec_name") != "aac")):
         raise RuntimeError("conversion output is not compatible H.264/AAC video")
+
+
+def browser_native_media(path: Path, extension: str, reader_mode: str) -> bool:
+    probe = media_probe(path)
+    streams = probe.get("streams") if isinstance(probe, dict) else None
+    media_format = probe.get("format") if isinstance(probe, dict) else None
+    if not isinstance(streams, list) or not isinstance(media_format, dict):
+        raise RuntimeError("source media has no stream metadata")
+    format_names = set(str(media_format.get("format_name") or "").split(","))
+    audio = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    video = [stream for stream in streams if stream.get("codec_type") == "video"
+             and not stream.get("disposition", {}).get("attached_pic")]
+    if reader_mode == "audio":
+        if not audio or video:
+            raise RuntimeError("native audio asset has invalid streams")
+        codec = str(audio[0].get("codec_name") or "")
+        if extension in {"mp3", "mpga"}:
+            return codec == "mp3"
+        if extension == "wav":
+            return "wav" in format_names and codec.startswith("pcm_")
+        if extension == "flac":
+            return codec == "flac"
+        if extension == "m4a":
+            return codec == "aac"
+        return False
+    if reader_mode != "video" or len(video) != 1 or len(audio) > 1:
+        raise RuntimeError("native video asset has invalid streams")
+    return (video[0].get("codec_name") == "h264" and video[0].get("pix_fmt") == "yuv420p"
+            and (not audio or audio[0].get("codec_name") == "aac")
+            and bool(format_names.intersection({"mov", "mp4", "m4a", "3gp", "3g2", "mj2"})))
+
+
+def prepare_native_media_item(item: dict, source: Path) -> dict:
+    if item.get("profile") != NATIVE_MEDIA_PROFILE:
+        return item
+    if browser_native_media(source, item["extension"], item["reader_mode"]):
+        return item
+    prepared = dict(item)
+    if item["reader_mode"] == "audio":
+        prepared.update(profile="ffmpeg-audio-mp3-v1", output_name="audio.mp3", transcode_media=True)
+    else:
+        prepared.update(profile="ffmpeg-video-mp4-h264-aac-v1", output_name="video.mp4", transcode_media=True)
+    return prepared
+
+
+def validate_native_media_output(path: Path, reader_mode: str) -> None:
+    probe = media_probe(path)
+    streams = probe.get("streams") if isinstance(probe, dict) else None
+    media_format = probe.get("format") if isinstance(probe, dict) else None
+    if not isinstance(streams, list) or not isinstance(media_format, dict):
+        raise RuntimeError("native media output has no stream metadata")
+    try:
+        duration = float(media_format.get("duration") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("native media output has invalid duration") from exc
+    if not 0 < duration <= 24 * 60 * 60:
+        raise RuntimeError("native media output duration is outside limits")
+    audio = [stream for stream in streams if stream.get("codec_type") == "audio"]
+    video = [stream for stream in streams if stream.get("codec_type") == "video"
+             and not stream.get("disposition", {}).get("attached_pic")]
+    if reader_mode == "audio" and (not audio or video):
+        raise RuntimeError("native audio output has invalid streams")
+    if reader_mode == "video" and (len(video) != 1 or len(audio) > 1):
+        raise RuntimeError("native video output has invalid streams")
 
 
 def embedded_pdf_fonts(path: Path) -> list[str]:
@@ -1329,10 +1430,20 @@ def validate_epub_content(path: Path) -> None:
             has_image = False
             for image in root.findall(".//{*}img"):
                 source = urllib.parse.unquote((image.attrib.get("src") or "").split("#", 1)[0])
-                image_path = posixpath.normpath(posixpath.join(posixpath.dirname(document_path), source))
-                if source and not image_path.startswith("../") and image_path in names:
+                if not source:
+                    raise RuntimeError("converted EPUB contains an image without a source")
+                if source.lower().startswith("data:image/"):
                     has_image = True
-                    break
+                    continue
+                parsed = urllib.parse.urlsplit(source)
+                if parsed.scheme or parsed.netloc:
+                    raise RuntimeError("converted EPUB contains an external image")
+                image_path = posixpath.normpath(posixpath.join(posixpath.dirname(document_path), parsed.path))
+                if image_path.startswith("../") or image_path not in names:
+                    raise RuntimeError(
+                        f"converted EPUB image resource is missing: {document_path} <- {source}"
+                    )
+                has_image = True
             meaningful.append(has_text or has_image)
         if not any(meaningful):
             raise RuntimeError("converted EPUB has no readable content")
@@ -1361,28 +1472,529 @@ def validate_html_content(path: Path) -> None:
         raise RuntimeError("converted HTML has no readable content")
 
 
+def validate_page_manifest(path: Path) -> None:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("converted page manifest is invalid") from exc
+    page_count = manifest.get("page_count") if isinstance(manifest, dict) else None
+    if (manifest.get("version") != 2 or manifest.get("kind") != "pdf-pages"
+            or type(page_count) is not int or page_count < 1 or "pages" in manifest):
+        raise RuntimeError("converted page manifest is invalid")
+
+
+def convert_spreadsheet_to_pages(source: Path, target: Path, work: Path, item: dict,
+                                 source_sha256: str, object_path: str) -> None:
+    output = work / "spreadsheet-html"
+    output.mkdir()
+    helper = Path(__file__).with_name("render_spreadsheet_html.py")
+    run_checked([
+        "/usr/bin/python3", str(helper), str(source), str(output),
+    ], timeout_seconds=SPREADSHEET_RENDER_COMMAND_TIMEOUT_SECONDS)
+    html_pages = sorted(output.glob("sheet-*/sheet.html"))
+    if not html_pages:
+        raise RuntimeError("LibreOffice produced no spreadsheet worksheet HTML")
+
+    expected_sheets, expected_values, expected_charts, expected_images = spreadsheet_source_inventory(
+        source, item.get("extension", source.suffix.lower().lstrip(".")),
+    )
+
+    if len(html_pages) < len(expected_sheets):
+        raise RuntimeError("spreadsheet HTML export omitted worksheet pages")
+    if len(expected_values) >= 50_000 and expected_charts == 0 and expected_images == 0:
+        html_pages = split_spreadsheet_html_rows(html_pages, work / "spreadsheet-html-chunks")
+    exported_html = "\n".join(page.read_text(encoding="utf-8", errors="replace") for page in html_pages)
+    visible_html = spreadsheet_text_key(extract_html_text(exported_html))
+    missing_values = [value for value in expected_values
+                      if not spreadsheet_text_present(value, visible_html)]
+    if missing_values:
+        diagnostics = [len(spreadsheet_text_key(value)) for value in missing_values[:8]]
+        raise RuntimeError(
+            f"spreadsheet HTML export omitted {len(missing_values)} non-empty cell value(s); "
+            f"normalized cell lengths: {diagnostics!r}"
+        )
+    exported_images = sum(len(image_sources(page.read_text(encoding="utf-8", errors="replace")))
+                          for page in html_pages)
+    if exported_images < expected_charts + expected_images:
+        raise RuntimeError("spreadsheet HTML export omitted chart or image objects")
+
+    rendered = work / "spreadsheet-rendered"
+    rendered.mkdir()
+    screenshots = render_spreadsheet_html(html_pages, rendered)
+    page_root = target.parent / "pages"
+    page_root.mkdir(parents=True, exist_ok=True)
+    page_count = 0
+    for number, image_path in enumerate(screenshots, 1):
+        destination = page_root / f"page-{number:06d}.webp"
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            image.save(destination, "WEBP", method=6, quality=85)
+        page_count = number
+    target.write_bytes(canonical_json({
+        "version": 2, "kind": "pdf-pages", "source_sha256": source_sha256,
+        "profile": item["profile"], "page_count": page_count,
+    }, pretty=True))
+
+
+def convert_spreadsheet_to_html(source: Path, target: Path, work: Path, item: dict) -> None:
+    """Publish each worksheet as selectable HTML, embedding its local chart assets."""
+    output = work / "spreadsheet-html"
+    output.mkdir()
+    helper = Path(__file__).with_name("render_spreadsheet_html.py")
+    run_checked([
+        "/usr/bin/python3", str(helper), str(source), str(output),
+    ], timeout_seconds=SPREADSHEET_RENDER_COMMAND_TIMEOUT_SECONDS)
+    html_pages = sorted(output.glob("sheet-*/sheet.html"))
+    if not html_pages:
+        raise RuntimeError("LibreOffice produced no spreadsheet worksheet HTML")
+
+    expected_sheets, expected_values, expected_charts, expected_images = spreadsheet_source_inventory(
+        source, item.get("extension", source.suffix.lower().lstrip(".")),
+    )
+    if len(html_pages) < len(expected_sheets):
+        raise RuntimeError("spreadsheet HTML export omitted worksheet pages")
+    if len(expected_values) >= 50_000 and expected_charts == 0 and expected_images == 0:
+        html_pages = split_spreadsheet_html_rows(html_pages, work / "spreadsheet-html-chunks")
+
+    exported_html = "\n".join(page.read_text(encoding="utf-8", errors="replace") for page in html_pages)
+    visible_html = spreadsheet_text_key(extract_html_text(exported_html))
+    missing_values = [value for value in expected_values
+                      if not spreadsheet_text_present(value, visible_html)]
+    if missing_values:
+        diagnostics = [len(spreadsheet_text_key(value)) for value in missing_values[:8]]
+        raise RuntimeError(
+            f"spreadsheet HTML export omitted {len(missing_values)} non-empty cell value(s); "
+            f"normalized cell lengths: {diagnostics!r}"
+        )
+    exported_images = sum(len(image_sources(page.read_text(encoding="utf-8", errors="replace")))
+                          for page in html_pages)
+    if exported_images < expected_charts + expected_images:
+        raise RuntimeError("spreadsheet HTML export omitted chart or image objects")
+
+    styles = []
+    sections = []
+    for index, page_path in enumerate(html_pages, 1):
+        inlined = inline_local_html_resources(
+            page_path.read_text(encoding="utf-8", errors="replace"), output, page_path.parent,
+        )
+        document = lxml_html.document_fromstring(inlined)
+        for style in document.xpath("//head/style"):
+            if style.text:
+                styles.append(style.text)
+        body = document.find("body")
+        if body is None:
+            raise RuntimeError(f"spreadsheet worksheet {index} has no HTML body")
+        contents = (body.text or "") + "".join(
+            lxml_html.tostring(child, encoding="unicode", method="html") for child in body
+        )
+        match = re.match(r"sheet-([0-9]+)", page_path.stem)
+        sheet_index = int(match.group(1)) - 1 if match else index - 1
+        title = expected_sheets[sheet_index] if sheet_index < len(expected_sheets) else f"Sheet {index}"
+        sections.append(
+            f'<section class="reader-spreadsheet-sheet"><h2>{html.escape(title)}</h2>{contents}</section>'
+        )
+    target.write_text(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
+        "html,body{min-height:100%;margin:0;background:#fff;color:#16191c}"
+        "body{box-sizing:border-box;width:max-content;min-width:100%;padding:12px;"
+        "font:14px/1.35 Arial,'Noto Sans',sans-serif}"
+        ".reader-spreadsheet-sheet{width:max-content;min-width:100%;margin:0 0 24px}"
+        ".reader-spreadsheet-sheet h2{position:sticky;left:0;width:max-content;"
+        "margin:0 0 8px;font-size:16px}"
+        ".reader-spreadsheet-sheet img,.reader-spreadsheet-sheet svg{max-width:none;height:auto}"
+        f"</style><style>{' '.join(styles)}</style></head><body>"
+        + "".join(sections) + "</body></html>",
+        encoding="utf-8",
+    )
+
+
+def render_spreadsheet_html(html_pages: list[Path], output: Path) -> list[Path]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("spreadsheet image rendering requires Playwright") from exc
+    screenshots = []
+    with sync_playwright() as playwright:
+        chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+        browser = playwright.chromium.launch(
+            headless=True, args=["--no-sandbox"], **({"channel": "chrome"} if chrome else {})
+        )
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 1600}, device_scale_factor=1)
+            for sheet_number, source in enumerate(html_pages, 1):
+                page.goto(source.resolve().as_uri(), wait_until="load", timeout=120000)
+                page.wait_for_function(
+                    "() => [...document.images].every(image => image.complete && image.naturalWidth > 0)",
+                    timeout=60000,
+                )
+                page.evaluate("""() => document.fonts?.ready.then(() => true)""")
+                dimensions = page.evaluate("""() => ({
+                  width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
+                  height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)
+                })""")
+                if dimensions["width"] < 2 or dimensions["height"] < 2:
+                    raise RuntimeError(f"spreadsheet worksheet {sheet_number} rendered blank")
+                width, height = dimensions["width"], dimensions["height"]
+                if (width <= SPREADSHEET_FULL_PAGE_MAX_EDGE
+                        and height <= SPREADSHEET_FULL_PAGE_MAX_EDGE
+                        and width * height <= SPREADSHEET_FULL_PAGE_MAX_PIXELS):
+                    page.set_viewport_size({"width": width, "height": min(height, 1600)})
+                    page.wait_for_timeout(80)
+                    target = output / f"sheet-{sheet_number:04d}.png"
+                    page.screenshot(path=str(target), full_page=True)
+                    screenshots.append(target)
+                    continue
+
+                tile_width, tile_height = min(width, 1800), min(height, 1600)
+                page.set_viewport_size({"width": tile_width, "height": tile_height})
+                page.wait_for_timeout(80)
+                dimensions = page.evaluate("""() => ({
+                  width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth),
+                  height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight)
+                })""")
+                columns = max(1, (max(0, dimensions["width"] - tile_width) + 1759) // 1760 + 1)
+                rows = max(1, (max(0, dimensions["height"] - tile_height) + 1559) // 1560 + 1)
+                for row in range(rows):
+                    for column in range(columns):
+                        page.evaluate("""({x, y}) => window.scrollTo(x, y)""", {
+                            "x": column * 1760, "y": row * 1560,
+                        })
+                        page.wait_for_timeout(80)
+                        target = output / f"sheet-{sheet_number:04d}-tile-{row:04d}-{column:04d}.png"
+                        page.screenshot(path=str(target))
+                        screenshots.append(target)
+            return screenshots
+        finally:
+            browser.close()
+
+
+def split_spreadsheet_html_rows(html_pages: list[Path], output: Path,
+                                rows_per_chunk: int = 50) -> list[Path]:
+    output.mkdir(parents=True, exist_ok=True)
+    result = []
+    for sheet_number, source in enumerate(html_pages, 1):
+        document = lxml_html.parse(str(source))
+        tables = document.xpath("//table")
+        if not tables:
+            result.append(source)
+            continue
+        table = max(tables, key=lambda candidate: len(candidate.xpath(".//tr")))
+        rows = table.xpath(".//tr")
+        if len(rows) <= rows_per_chunk:
+            result.append(source)
+            continue
+        table_path = document.getpath(table)
+        for chunk_number, start in enumerate(range(0, len(rows), rows_per_chunk), 1):
+            end = min(len(rows), start + rows_per_chunk)
+            chunk = copy.deepcopy(document)
+            chunk_table = chunk.xpath(table_path)[0]
+            chunk_rows = chunk_table.xpath(".//tr")
+            for index in range(len(chunk_rows) - 1, -1, -1):
+                if not start <= index < end:
+                    parent = chunk_rows[index].getparent()
+                    if parent is not None:
+                        parent.remove(chunk_rows[index])
+            target = output / f"sheet-{sheet_number:04d}-chunk-{chunk_number:04d}.html"
+            target.write_bytes(lxml_html.tostring(
+                chunk, encoding="utf-8", method="html", doctype="<!DOCTYPE html>"))
+            result.append(target)
+    return result
+
+
+def spreadsheet_source_inventory(source: Path, extension: str = "") -> tuple[list[str], list[str], int, int]:
+    extension = (extension or source.suffix.lower().lstrip(".")).lower().lstrip(".")
+    if extension == "csv":
+        raw = source.read_bytes()
+        text = None
+        for encoding in ("utf-8-sig", "gb18030", "cp1252"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if text is None:
+            raise RuntimeError("spreadsheet CSV text encoding is unreadable")
+        sample = text[:8192]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        values = [cell.strip() for row in csv.reader(io.StringIO(text, newline=""), dialect)
+                  for cell in row if cell.strip()]
+        return ["Sheet1"], list(dict.fromkeys(values)), 0, 0
+    try:
+        with zipfile.ZipFile(source) as archive:
+            names = set(archive.namelist())
+            if "content.xml" in names and extension == "ods":
+                content = ET.fromstring(archive.read("content.xml"))
+                tables = content.findall(".//{*}table")
+                sheets = [next((value for key, value in table.attrib.items()
+                                if key.endswith("}name")), "") for table in tables]
+                values = []
+                for table in tables:
+                    for cell in table.findall(".//{*}table-cell"):
+                        text = "".join(node.text or "" for node in cell.findall(".//{*}p"))
+                        if text.strip():
+                            values.append(text.strip())
+                charts = sum(name.startswith("Object ") and name.endswith("/content.xml")
+                             for name in names)
+                images = sum(name.startswith("Pictures/") and not name.endswith("/")
+                             for name in names)
+                return sheets, list(dict.fromkeys(values)), charts, images
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            targets = {node.attrib.get("Id"): node.attrib.get("Target", "")
+                       for node in relationships.findall(".//{*}Relationship")}
+            sheet_nodes = workbook.findall(".//{*}sheet")
+            sheets = [node.attrib.get("name", "") for node in sheet_nodes]
+            shared_strings = []
+            if "xl/sharedStrings.xml" in names:
+                strings = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                shared_strings = ["".join(node.itertext()) for node in strings.findall("{*}si")]
+            values = []
+            relationship_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+            for sheet_node in sheet_nodes:
+                target = targets.get(sheet_node.get(relationship_id), "")
+                worksheet = posixpath.normpath(target.lstrip("/") if target.startswith("/")
+                                               else posixpath.join("xl", target))
+                if worksheet not in names:
+                    raise RuntimeError(f"spreadsheet worksheet XML is missing: {sheet_node.get('name', '')}")
+                root = ET.fromstring(archive.read(worksheet))
+                hidden_rows = {int(row.get("r")) for row in root.findall(".//{*}row")
+                               if row.get("r", "").isdigit() and row.get("hidden") in {"1", "true"}}
+                hidden_columns = set()
+                for column in root.findall(".//{*}cols/{*}col"):
+                    if column.get("hidden") not in {"1", "true"}:
+                        continue
+                    first, last = int(column.get("min", "1")), int(column.get("max", "1"))
+                    hidden_columns.update(range(first, last + 1))
+                for cell in root.findall(".//{*}c"):
+                    coordinate = cell.get("r", "")
+                    row_match = re.search(r"([0-9]+)$", coordinate)
+                    column_match = re.match(r"([A-Z]+)", coordinate, re.IGNORECASE)
+                    if not row_match or not column_match or int(row_match.group(1)) in hidden_rows:
+                        continue
+                    column_number = 0
+                    for letter in column_match.group(1).upper():
+                        column_number = column_number * 26 + ord(letter) - ord("A") + 1
+                    if column_number in hidden_columns:
+                        continue
+                    kind = cell.attrib.get("t")
+                    if kind == "s":
+                        value = cell.findtext("{*}v", "")
+                        if value.isdigit() and int(value) < len(shared_strings):
+                            text = shared_strings[int(value)]
+                            if text.strip():
+                                values.append(text.strip())
+                    elif kind in {"inlineStr", "str"}:
+                        node = cell.find("{*}is") if kind == "inlineStr" else cell.find("{*}v")
+                        text = "".join(node.itertext()) if node is not None else ""
+                        if text.strip():
+                            values.append(text.strip())
+            charts = sum(name.startswith("xl/charts/chart") and name.endswith(".xml") for name in names)
+            images = sum(name.startswith("xl/media/") and not name.endswith("/") for name in names)
+            return sheets, list(dict.fromkeys(values)), charts, images
+    except (zipfile.BadZipFile, KeyError, ET.ParseError):
+        try:
+            import xlrd
+            legacy = xlrd.open_workbook(str(source), on_demand=True)
+        except Exception as exc:
+            raise RuntimeError("spreadsheet workbook structure is unreadable") from exc
+        sheets, values = [], []
+        try:
+            for sheet in legacy.sheets():
+                sheets.append(sheet.name)
+                for row in range(sheet.nrows):
+                    row_info = sheet.rowinfo_map.get(row)
+                    if row_info and row_info.hidden:
+                        continue
+                    for column in range(sheet.ncols):
+                        column_info = sheet.colinfo_map.get(column)
+                        if column_info and column_info.hidden:
+                            continue
+                        value = sheet.cell_value(row, column)
+                        if isinstance(value, str) and value.strip():
+                            values.append(value.strip())
+        finally:
+            legacy.release_resources()
+        return sheets, list(dict.fromkeys(values)), 0, 0
+
+
+def spreadsheet_text_variants(value: str) -> set[str]:
+    variants = {value}
+    for encoding in ("latin-1", "cp1252"):
+        try:
+            variants.add(value.encode(encoding).decode("utf-8"))
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return variants
+
+
+def spreadsheet_text_key(value: str) -> str:
+    """Ignore layout whitespace inserted or normalized by HTML export."""
+    return re.sub(r"\s+", "", value)
+
+
+def spreadsheet_text_present(value: str, rendered_text: str) -> bool:
+    for candidate in spreadsheet_text_variants(value):
+        key = spreadsheet_text_key(candidate)
+        if not key or key in rendered_text:
+            return True
+        position = 0
+        matched = True
+        for offset in range(0, len(key), 24):
+            chunk = key[offset:offset + 24]
+            found = rendered_text.find(chunk, position)
+            if found >= 0:
+                position = found + len(chunk)
+                continue
+            window_end = min(len(rendered_text), position + len(chunk) * 8 + 512)
+            window = rendered_text[position:window_end]
+            for char in chunk:
+                char_position = window.find(char)
+                if char_position < 0:
+                    matched = False
+                    break
+                window = window[char_position + 1:]
+            if not matched:
+                break
+            position = window_end - len(window)
+        if matched:
+            return True
+        chunks = [key[offset:offset + 16] for offset in range(0, len(key), 16)]
+        if all(chunk in rendered_text for chunk in chunks):
+            return True
+    return False
+
+
+class _ImageSources(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.sources = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "img":
+            self.sources.append(dict(attrs).get("src", "").strip())
+
+
+class _VisibleText(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in {"td", "th", "tr", "br", "p", "div", "li"}:
+            self.parts.append(" ")
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+
+def extract_html_text(document: str) -> str:
+    parser = _VisibleText()
+    parser.feed(document)
+    return " ".join(parser.parts)
+
+
+def image_sources(document: str) -> list[str]:
+    parser = _ImageSources()
+    parser.feed(document)
+    return parser.sources
+
+
+def validate_mhtml_content(path: Path) -> None:
+    validate_html_content(path)
+    parser = _ImageSources()
+    parser.feed(path.read_text(encoding="utf-8", errors="replace"))
+    for source in parser.sources:
+        if not source:
+            raise RuntimeError("converted MHTML contains an image without a source")
+        match = re.fullmatch(r"data:image/(?:gif|jpeg|png|webp);base64,([A-Za-z0-9+/]*={0,2})", source, re.IGNORECASE)
+        if not match:
+            raise RuntimeError("converted MHTML contains an unembedded image")
+        try:
+            payload = base64.b64decode(match.group(1), validate=True)
+            with Image.open(io.BytesIO(payload)) as image:
+                image.verify()
+        except Exception as exc:
+            raise RuntimeError("converted MHTML contains an invalid embedded image") from exc
+
+
 def validate_reader_content(path: Path, item: dict, work: Path) -> None:
     mode = item["reader_mode"]
     if mode == "pdf":
-        validate_pdf_content(path, work)
+        if item.get("profile") == SPREADSHEET_HTML_PROFILE:
+            validate_page_manifest(path)
+        else:
+            validate_pdf_content(path, work)
     elif mode == "epub":
         validate_epub_content(path)
     elif mode == "docx":
         validate_docx_content(path)
     elif mode == "html":
-        validate_html_content(path)
+        if item.get("extension") in {"mht", "mhtml"}:
+            validate_mhtml_content(path)
+        else:
+            validate_html_content(path)
     elif mode == "foliate" and path.stat().st_size == 0:
         raise RuntimeError("original Foliate asset is empty")
 
 
-def convert_file(item: dict, source: Path, target: Path, work: Path) -> None:
+def convert_reader_image(source: Path, target: Path) -> None:
+    with READER_IMAGE_LOCK:
+        max_pixels = Image.MAX_IMAGE_PIXELS
+        try:
+            Image.MAX_IMAGE_PIXELS = MAX_READER_IMAGE_PIXELS
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(source) as image:
+                    # Some PSDs expose a broken layer sequence even though
+                    # their first composite frame is readable.
+                    try:
+                        image.seek(0)
+                    except EOFError:
+                        pass
+                    image.thumbnail(
+                        (MAX_READER_IMAGE_EDGE, MAX_READER_IMAGE_EDGE), Image.Resampling.LANCZOS,
+                    )
+                    image.convert("RGB").save(target, "WEBP", method=6, quality=88)
+        finally:
+            Image.MAX_IMAGE_PIXELS = max_pixels
+
+
+def convert_file(item: dict, source: Path, target: Path, work: Path,
+                 source_sha256: str = "", object_path: str = "") -> None:
     ext = item["extension"]
+    if item.get("profile") == NATIVE_MEDIA_PROFILE:
+        shutil.copyfile(source, target)
+        return
+    if item.get("reader_mode") == "swf":
+        shutil.copyfile(source, target)
+        return
+    if item.get("transcode_media"):
+        if item["reader_mode"] == "audio":
+            run_checked([
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source), "-map", "0:a:0", "-vn", "-sn", "-dn",
+                "-map_metadata", "-1", "-c:a", "libmp3lame", "-q:a", "3", str(target),
+            ], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
+        else:
+            run_checked([
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source), "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+                "-map_metadata", "-1", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(target),
+            ], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
+        return
     office_profile = (work / "libreoffice-profile").resolve().as_uri()
     explicit_password = item.get("source_password") or source_password(item.get("repo", ""), item.get("path", ""))
     password = explicit_password
     if not password and ext == "xlsx":
         password = os.environ.get("READER_CONVERSION_PASSWORD", "")
-    if password and ext in {"doc", "docx", "ppt", "pptx", "pps", "xls", "xlsx"}:
+    ole_xlsx = ext == "xlsx" and source.read_bytes()[:8] == OLE_SIGNATURE
+    if (password or ole_xlsx) and ext in {"doc", "docx", "ppt", "pptx", "pps", "xls", "xlsx"}:
         import msoffcrypto
         with source.open("rb") as encrypted:
             document = None
@@ -1392,6 +2004,10 @@ def convert_file(item: dict, source: Path, target: Path, work: Path) -> None:
                 if explicit_password:
                     raise
             if document is not None and document.is_encrypted():
+                if not password:
+                    raise RuntimeError(
+                        "encrypted spreadsheet requires READER_CONVERSION_PASSWORD or a source password"
+                    )
                 decrypted_source = work / f"decrypted.{ext}"
                 document.load_key(password=password)
                 with decrypted_source.open("wb") as decrypted:
@@ -1403,15 +2019,11 @@ def convert_file(item: dict, source: Path, target: Path, work: Path) -> None:
                 from .repair_gbk_pdf import repair_pdf
             except ImportError:
                 from repair_gbk_pdf import repair_pdf
-            try:
-                repair_pdf(source, target)
-            except ValueError as exc:
-                if "does not contain the expected malformed GBK fonts" not in str(exc):
-                    raise
-                shutil.copyfile(source, target)
+            repair_pdf(source, target)
             return
         if not password:
-            raise RuntimeError("protected PDF has no known password")
+            shutil.copyfile(source, target)
+            return
         run_checked(["qpdf", f"--password={password}", "--decrypt", str(source), str(target)])
     elif ext in {"htm", "html"}:
         source_url = item.get("source_url")
@@ -1461,6 +2073,17 @@ def convert_file(item: dict, source: Path, target: Path, work: Path) -> None:
                 shutil.move(produced, target)
             else:
                 raise
+    elif ext in {"txt", "md", "markdown", "vcf", "ini"}:
+        shutil.copyfile(source, target)
+    elif ext in {"jpg", "jpeg", "png", "gif", "bmp", "webp", "psd"}:
+        # Keep the source repository untouched, but serve one CDN-friendly
+        # image format from the shared Reader bucket.
+        if item.get("reader_mode") == "image" and item.get("output_name", "").endswith(".webp"):
+            convert_reader_image(source, target)
+        else:
+            shutil.copyfile(source, target)
+    elif ext == "pdf" and item.get("profile") == "native-pdf-v1":
+        shutil.copyfile(source, target)
     elif ext in {"epub", "mobi", "azw3", "fb2"} and item.get("reader_mode") == "foliate":
         shutil.copyfile(source, target)
     elif ext == "odt":
@@ -1504,12 +2127,31 @@ def convert_file(item: dict, source: Path, target: Path, work: Path) -> None:
                     raise
                 time.sleep(2)
     elif ext in {"ppt", "pptx", "pps", "odp", "xls", "xlsx", "csv", "ods", "wps"}:
+        if item.get("profile") == SPREADSHEET_HTML_PROFILE:
+            spreadsheet_source = source
+            if ext == "xlsx" and source.read_bytes()[:8] == OLE_SIGNATURE:
+                spreadsheet_source = work / "spreadsheet-source.xls"
+                shutil.copyfile(source, spreadsheet_source)
+            elif ext == "xls" and zipfile.is_zipfile(source):
+                with zipfile.ZipFile(source) as workbook:
+                    is_ooxml_workbook = "xl/workbook.xml" in workbook.namelist()
+                if is_ooxml_workbook:
+                    spreadsheet_source = work / "spreadsheet-source.xlsx"
+                    shutil.copyfile(source, spreadsheet_source)
+            convert_spreadsheet_to_html(spreadsheet_source, target, work, item)
+            return
         out = work / "office-pdf"
         out.mkdir()
         office_source = source
         if ext == "xlsx" and source.read_bytes()[:8] == OLE_SIGNATURE:
             office_source = work / "source.xls"
             shutil.copyfile(source, office_source)
+        elif ext == "xls" and zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source) as workbook:
+                is_ooxml_workbook = "xl/workbook.xml" in workbook.namelist()
+            if is_ooxml_workbook:
+                office_source = work / "source.xlsx"
+                shutil.copyfile(source, office_source)
         run_checked([
             "libreoffice", "--headless", f"-env:UserInstallation={office_profile}",
             "--convert-to", "pdf", "--outdir", str(out), str(office_source),
@@ -1527,14 +2169,15 @@ def convert_file(item: dict, source: Path, target: Path, work: Path) -> None:
         ], timeout_seconds=POSTSCRIPT_COMMAND_TIMEOUT_SECONDS)
     elif ext in {"caj", "kdh"}:
         convert_caj_family(source, target, work)
-    elif ext in {"ape", "wma", "amr"}:
+    elif ext in {"ape", "wma", "amr", "flac", "m4a", "mpga", "wav", "asx"} and (
+            ext != "asx" or item.get("source_media_mode") == "audio"):
         run_checked([
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(source), "-map", "0:a:0", "-vn", "-sn", "-dn",
             "-map_metadata", "-1", "-c:a", "libmp3lame", "-q:a", "3", str(target),
         ], timeout_seconds=MEDIA_COMMAND_TIMEOUT_SECONDS)
-    elif ext in {"flv", "f4v", "rm", "rmvb", "mkv", "avi", "mpg", "mpeg", "mts", "ts", "wmv"}:
-        if ext in {"rm", "rmvb"} and item.get("source_media_mode") == "audio":
+    elif ext in {"asx", "flv", "f4v", "rm", "rmvb", "mkv", "avi", "mpg", "mpeg", "mts", "ts", "wmv", "mov", "mp4"}:
+        if ext in {"asx", "rm", "rmvb"} and item.get("source_media_mode") == "audio":
             run_checked([
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "lavfi", "-i", "color=c=black:s=640x360:r=1",
@@ -1571,7 +2214,7 @@ def normalized_office_pdf(source: Path, work: Path) -> Path:
     return pdf
 
 
-def validate_output(path: Path, reader_mode: str) -> None:
+def validate_output(path: Path, reader_mode: str, *, native_media=False) -> None:
     if not path.exists() or path.stat().st_size == 0:
         raise RuntimeError("conversion output is empty")
     if path.stat().st_size > MAX_SOURCE_BYTES:
@@ -1580,6 +2223,8 @@ def validate_output(path: Path, reader_mode: str) -> None:
         raise RuntimeError("conversion output is not a PDF")
     if reader_mode == "html" and not path.read_bytes():
         raise RuntimeError("conversion output is empty HTML")
+    if reader_mode in {"text", "markdown", "image"} and not path.read_bytes():
+        raise RuntimeError("conversion output is empty")
     if reader_mode == "epub":
         with zipfile.ZipFile(path) as archive:
             if archive.read("mimetype") != b"application/epub+zip":
@@ -1594,7 +2239,12 @@ def validate_output(path: Path, reader_mode: str) -> None:
             if not archive.read("word/document.xml").strip():
                 raise RuntimeError("DOCX document body is empty")
     if reader_mode in {"audio", "video"}:
-        validate_media_output(path, reader_mode)
+        if native_media:
+            validate_native_media_output(path, reader_mode)
+        else:
+            validate_media_output(path, reader_mode)
+    if reader_mode == "swf" and path.read_bytes()[:3] not in {b"FWS", b"CWS", b"ZWS"}:
+        raise RuntimeError("conversion output is not a SWF")
 
 
 def validate_chm_epub(path: Path) -> None:
@@ -1670,6 +2320,15 @@ def convert_item(item: dict, bundle: Path, reusable: dict | None = None) -> dict
         work = Path(root)
         source = work / f"source.{item['extension']}"
         digest, source_bytes = download_source(item["source_url"], source)
+        if item.get("profile") == NATIVE_MEDIA_PROFILE:
+            item = prepare_native_media_item(item, source)
+        if item["extension"] == "asx":
+            item = dict(item)
+            item["source_media_mode"] = source_media_mode(source)
+            if item["source_media_mode"] == "audio":
+                item.update(profile="ffmpeg-audio-mp3-v1", reader_mode="audio", output_name="audio.mp3")
+            else:
+                item.update(profile="ffmpeg-video-mp4-h264-aac-v1", reader_mode="video", output_name="video.mp4")
         if item["extension"] in {"rm", "rmvb"}:
             item = dict(item)
             item["source_media_mode"] = source_media_mode(source)
@@ -1684,36 +2343,79 @@ def convert_item(item: dict, bundle: Path, reusable: dict | None = None) -> dict
             item["profile"], extension=item["extension"],
             source_revision=item["source_revision"], key=item["key"],
         )
-        object_path = existing["path"] if existing else f"objects/{digest[:2]}/{digest}/{profile_path}/{item['output_name']}"
-        validate_object_path(object_path)
+        if item.get("output_name") == "page-manifest.json":
+            profile_path = hashlib.sha256(
+                f"{item['key']}\0{item['profile']}".encode("utf-8")
+            ).hexdigest()[:16]
+        reusable_path = existing.get("path") if existing else None
+        object_path = reusable_path or (
+            f"objects/{digest[:2]}/{digest}/{profile_path}/{item['output_name']}"
+        )
+        validate_storage_path(object_path)
         target = bundle / object_path
         target.parent.mkdir(parents=True, exist_ok=True)
         reused = existing is not None
         with artifact_lock(target):
             if not target.exists():
                 if existing:
-                    asset_url = f"https://huggingface.co/datasets/{READER_ASSETS_REPO}/resolve/main/{existing['path']}"
-                    download_existing(asset_url, target, existing["sha256"])
+                    try:
+                        existing_bucket = existing.get("bucket") or shared.READER_ASSETS_BUCKET
+                        asset_url = (f"https://huggingface.co/buckets/{existing_bucket}/resolve/"
+                                     f"{existing['path']}")
+                        download_existing(asset_url, target, existing["sha256"])
+                    except Exception as error:
+                        if not is_remote_not_found(error):
+                            raise
+                        # The manifest can outlive the dataset object. Rebuild at
+                        # the same content-addressed path from the source instead
+                        # of publishing another broken mapping.
+                        print(f"reusable Reader object missing; rebuilding "
+                              f"{item.get('repo', '')}/{item.get('path', item['key'])}")
+                        existing = None
+                        reused = False
+                if existing:
                     if target.stat().st_size != existing["bytes"]:
                         raise RuntimeError("reusable reader artifact size mismatch")
-                    validate_output(target, item["reader_mode"])
+                    if item.get("output_name") == "page-manifest.json":
+                        validate_page_manifest(target)
+                    else:
+                        validate_output(target, item["reader_mode"], native_media=item.get("profile") == NATIVE_MEDIA_PROFILE)
                     validate_reader_content(target, item, work)
                 else:
                     temporary = work / item["output_name"]
-                    convert_file(item, source, temporary, work)
+                    if item.get("output_name") == "page-manifest.json":
+                        convert_file(item, source, temporary, work, digest, object_path)
+                    else:
+                        convert_file(item, source, temporary, work)
                     if item["reader_mode"] == "epub" and item["extension"] != "chm":
                         sanitize_chm_epub(temporary, work)
-                    validate_output(temporary, item["reader_mode"])
+                    if item.get("output_name") == "page-manifest.json":
+                        validate_page_manifest(temporary)
+                    else:
+                        validate_output(temporary, item["reader_mode"], native_media=item.get("profile") == NATIVE_MEDIA_PROFILE)
                     if item["extension"] in {"odt", "rtf", "chm"}:
                         validate_html_content(temporary)
                     if item["extension"] == "djvu":
                         validate_djvu_pdf(temporary, work)
-                    if item["extension"] in {"doc", "docx", "htm", "html", "ppt", "pptx", "pps", "odp", "xls", "xlsx", "csv", "ods", "wps"} and item["reader_mode"] == "pdf":
+                    if (item["extension"] in {"doc", "docx", "htm", "html", "ppt", "pptx", "pps", "odp", "xls", "xlsx", "csv", "ods", "wps"}
+                            and item["reader_mode"] == "pdf"
+                            and item.get("output_name") != "page-manifest.json"):
                         validate_office_pdf(temporary, item, work, source)
                     validate_reader_content(temporary, item, work)
+                    if item.get("output_name") == "page-manifest.json":
+                        staged_pages = temporary.parent / "pages"
+                        final_pages = target.parent / "pages"
+                        if not staged_pages.is_dir():
+                            raise RuntimeError("spreadsheet page stream is missing")
+                        if final_pages.exists():
+                            shutil.rmtree(final_pages)
+                        shutil.move(staged_pages, final_pages)
                     shutil.move(temporary, target)
             else:
-                validate_output(target, item["reader_mode"])
+                if item.get("output_name") == "page-manifest.json":
+                    validate_page_manifest(target)
+                else:
+                    validate_output(target, item["reader_mode"], native_media=item.get("profile") == NATIVE_MEDIA_PROFILE)
                 if item["extension"] == "chm" and item["reader_mode"] == "epub":
                     validate_chm_epub(target)
                 elif item["extension"] == "chm":
@@ -1743,7 +2445,10 @@ def convert_item(item: dict, bundle: Path, reusable: dict | None = None) -> dict
                 # profile. Hash all resources so those builds never overwrite
                 # each other's immutable URLs.
                 staged_chapters = work / "chapter-bundle"
-                epub_chapters.build_bundle(chapter_source, staged_chapters)
+                epub_chapters.build_bundle(
+                    chapter_source, staged_chapters,
+                    include_all_documents=item["extension"] == "chm",
+                )
                 chapter_parent = (Path(*Path(object_path).parts[:3])
                                   / epub_chapters.bundle_version(staged_chapters)
                                   / f"{Path(object_path).parent.name}-{EPUB_CHAPTER_PROFILE}")
@@ -1763,10 +2468,13 @@ def convert_item(item: dict, bundle: Path, reusable: dict | None = None) -> dict
             "source_sha256": digest, "source_bytes": source_bytes,
             "source_extension": item["extension"], "profile": item["profile"],
             "reader_mode": item["reader_mode"], "path": object_path, "bytes": target.stat().st_size,
-            "sha256": file_sha256(target), "reused": reused,
+        "sha256": file_sha256(target), "reused": reused,
         }
         if item["extension"] == "epub" and item["reader_mode"] == "pdf":
             result["fallback_path"] = object_path
+        if item.get("output_name") == "page-manifest.json":
+            result["page_stream"] = True
+            result["page_count"] = json.loads(target.read_text(encoding="utf-8"))["page_count"]
         if chapter_manifest_path:
             result["chapter_manifest"] = chapter_manifest_path
             result["chapter_bundle_profile"] = EPUB_CHAPTER_PROFILE
@@ -1813,6 +2521,7 @@ def main() -> int:
         "version": 1,
         "results": results,
         "force_rebuild": bool(queue_data.get("force_rebuild")),
+        "bucket_migration": bool(queue_data.get("bucket_migration")),
     }
     if queue_data.get("authoritative_snapshot") is True:
         bundle_data["active_keys"] = queue_data.get("active_keys", [])

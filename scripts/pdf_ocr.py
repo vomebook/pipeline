@@ -82,6 +82,8 @@ NATIVE_PAGE_RATIO = float(os.environ.get("PDF_OCR_NATIVE_PAGE_RATIO", "0.90"))
 MAX_PAGE_PIXELS = int(os.environ.get("PDF_OCR_MAX_PAGE_PIXELS", "50000000"))
 COMMAND_TIMEOUT = int(os.environ.get("PDF_OCR_COMMAND_TIMEOUT", "600"))
 OCR_TIMEOUT = int(os.environ.get("PDF_OCR_PAGE_TIMEOUT", "300"))
+TEXT_PROBE_BATCH_PAGES = 100
+NATIVE_TEXT_BATCH_PAGES = 50
 MI = 1024 * 1024
 OCR_OBJECT_PATH_RE = re.compile(
     r"^objects/[0-9a-f]{2}/[0-9a-f]{64}/[0-9a-f]{16}/"
@@ -206,21 +208,21 @@ def clean_text(value: str) -> str:
 class _BBoxParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.words: list[dict] = []
-        self.page_width = 0.0
-        self.page_height = 0.0
+        self.pages: list[dict] = []
+        self._page: dict | None = None
         self._word: dict | None = None
         self._parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs) -> None:
         attrs = dict(attrs)
         if tag == "page":
-            self.page_width = float(attrs.get("width") or 0)
-            self.page_height = float(attrs.get("height") or 0)
+            self._page = {"width": float(attrs.get("width") or 0),
+                          "height": float(attrs.get("height") or 0), "words": []}
+            self.pages.append(self._page)
         elif tag == "word":
             self._word = {
-                "x0": float(attrs.get("xMin") or 0), "y0": float(attrs.get("yMin") or 0),
-                "x1": float(attrs.get("xMax") or 0), "y1": float(attrs.get("yMax") or 0),
+                "x0": float(attrs.get("xmin") or 0), "y0": float(attrs.get("ymin") or 0),
+                "x1": float(attrs.get("xmax") or 0), "y1": float(attrs.get("ymax") or 0),
             }
             self._parts = []
 
@@ -231,19 +233,17 @@ class _BBoxParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == "word" and self._word is not None:
             text = clean_text("".join(self._parts))
-            if text:
-                self.words.append({**self._word, "text": text, "confidence": 1.0, "source": "native"})
+            if text and self._page is not None:
+                self._page["words"].append(
+                    {**self._word, "text": text, "confidence": 1.0, "source": "native"})
             self._word = None
             self._parts = []
+        elif tag == "page":
+            self._page = None
 
 
-def native_page(path: Path, page: int) -> dict:
-    """Extract words and coordinates from the PDF text layer."""
-    raw = _run(["pdftotext", "-bbox-layout", "-f", str(page), "-l", str(page), str(path), "-"])
-    parser = _BBoxParser()
-    parser.feed(raw)
-    words = parser.words
-    # pdftotext's y origin is top-left, matching the browser overlay.
+def _native_page_result(page: int, parsed: dict) -> dict:
+    words = parsed["words"]
     lines: list[str] = []
     previous_y = None
     current: list[str] = []
@@ -259,44 +259,82 @@ def native_page(path: Path, page: int) -> dict:
     text = "\n".join(lines).strip()
     return {
         "page": page, "status": "ready", "source": "native", "text": text,
-        "blocks": normalize_blocks(words, parser.page_width, parser.page_height),
-        "width": parser.page_width, "height": parser.page_height,
+        "blocks": normalize_blocks(words, parsed["width"], parsed["height"]),
+        "width": parsed["width"], "height": parsed["height"],
     }
 
 
-def page_text_probe(path: Path, page: int) -> int:
-    for mode in ([], ["-raw"], ["-layout"]):
-        raw = _run(["pdftotext", *mode, "-f", str(page), "-l", str(page),
-                    "-enc", "UTF-8", str(path), "-"])
-        count = len(re.sub(r"\s+", "", clean_text(raw)))
-        if count:
-            return count
-    return 0
+def _native_pages_single(path: Path, start: int, end: int) -> dict[int, dict]:
+    raw = _run(["pdftotext", "-bbox-layout", "-f", str(start), "-l", str(end), str(path), "-"])
+    parser = _BBoxParser()
+    parser.feed(raw)
+    if len(parser.pages) != end - start + 1:
+        raise RuntimeError("pdftotext returned an incomplete page range")
+    return {number: _native_page_result(number, parsed)
+            for number, parsed in zip(range(start, end + 1), parser.pages)}
 
 
-def document_text_probe(path: Path, page_count: int) -> list[int]:
-    """Extract a document's text once, then split it into PDF pages.
-
-    Starting Poppler once per page makes planning multi-thousand-page books
-    needlessly slow.  Keep the alternate extraction modes because repaired
-    CJK fonts may only decode through ``-raw`` or ``-layout`` on some Poppler
-    builds.
-    """
-    for mode in ([], ["-raw"], ["-layout"]):
+def native_pages(path: Path, pages, batch_size: int = NATIVE_TEXT_BATCH_PAGES) -> dict[int, dict]:
+    """Extract native text and coordinates in bounded Poppler process batches."""
+    numbers = sorted(set(int(page) for page in pages))
+    if not numbers:
+        return {}
+    if batch_size < 1 or numbers[0] < 1:
+        raise ValueError("invalid native page batch")
+    output = {}
+    index = 0
+    while index < len(numbers):
+        start = end = numbers[index]
+        index += 1
+        while index < len(numbers) and numbers[index] == end + 1 and end - start + 1 < batch_size:
+            end = numbers[index]
+            index += 1
         try:
-            raw = _run(["pdftotext", *mode, "-enc", "UTF-8", str(path), "-"])
-        except RuntimeError:
-            continue
-        pages = raw.split("\f")[:page_count]
-        counts = [len(re.sub(r"\s+", "", clean_text(text))) for text in pages]
-        if any(counts) or not raw:
-            return counts + [0] * (page_count - len(counts))
-    return [0] * page_count
+            output.update(_native_pages_single(path, start, end))
+        except (RuntimeError, OSError):
+            # Preserve per-page recovery when one malformed page breaks a batch.
+            for page in range(start, end + 1):
+                try:
+                    output.update(_native_pages_single(path, page, page))
+                except (RuntimeError, OSError):
+                    raise
+    return output
+
+
+def native_page(path: Path, page: int) -> dict:
+    """Extract words and coordinates from one PDF text page."""
+    return native_pages(path, [page], batch_size=1)[page]
+
+
+def page_text_probe(path: Path, page: int) -> int:
+    raw = _run(["pdftotext", "-f", str(page), "-l", str(page), "-enc", "UTF-8", str(path), "-"])
+    return len(re.sub(r"\s+", "", clean_text(raw)))
+
+
+def _split_text_pages(raw: str, expected: int) -> list[str]:
+    pages = raw.split("\f")
+    if raw.endswith("\f"):
+        pages.pop()
+    if len(pages) != expected:
+        raise ValueError("pdftotext returned an incomplete text page range")
+    return pages
 
 
 def probe_pdf(path: Path) -> dict:
     page_count = pdf_page_count(path)
-    page_chars = document_text_probe(path, page_count)
+    page_chars = []
+    for start in range(1, page_count + 1, TEXT_PROBE_BATCH_PAGES):
+        end = min(page_count, start + TEXT_PROBE_BATCH_PAGES - 1)
+        try:
+            raw = _run(["pdftotext", "-f", str(start), "-l", str(end), "-enc", "UTF-8", str(path), "-"])
+            text_pages = _split_text_pages(raw, end - start + 1)
+            page_chars.extend(len(re.sub(r"\s+", "", clean_text(text))) for text in text_pages)
+        except (RuntimeError, ValueError, OSError):
+            for page in range(start, end + 1):
+                try:
+                    page_chars.append(page_text_probe(path, page))
+                except (RuntimeError, OSError):
+                    page_chars.append(0)
     native_pages = sum(chars >= MIN_NATIVE_PAGE_CHARS for chars in page_chars)
     ratio = native_pages / page_count
     if native_pages == page_count:
@@ -310,6 +348,36 @@ def probe_pdf(path: Path) -> dict:
         "native_pages": native_pages, "native_page_ratio": ratio,
         "classification": classification,
     }
+
+
+def reader_presentation(path: Path) -> dict:
+    """Inspect encoded images without rendering or recompressing the document."""
+    import pymupdf
+    inspected = 0
+    binary_images = 0
+    filters = set()
+    try:
+        with pymupdf.open(path) as document:
+            for page in document:
+                # Image-info includes inline images that get_images can omit.
+                binary_images += sum(image.get("bpc") == 1 for image in page.get_image_info())
+                filters.update(str(image[8]) for image in page.get_images(full=True)
+                               if len(image) > 8 and image[8])
+                inspected += 1
+        if not inspected:
+            raise ValueError("empty PDF")
+        return {"strategy": "preserve-pdf" if binary_images else "page-stream",
+                "reason": "bitonal-raster" if binary_images else "no-bitonal-raster",
+                "complete": True, "inspected_pages": inspected,
+                "bitonal_images": binary_images, "filters": sorted(filters)}
+    except Exception as error:
+        return {"strategy": "preserve-pdf", "reason": "inspection-failed",
+                "complete": False, "inspected_pages": inspected,
+                "error_type": type(error).__name__}
+
+
+def preserves_reader_pdf(item: dict) -> bool:
+    return item.get("reader_presentation", {}).get("strategy") == "preserve-pdf"
 
 
 def normalize_blocks(blocks, width: float, height: float) -> list[dict]:
@@ -531,57 +599,19 @@ def reader_webp_quality(image, full_page_scan: bool) -> int:
                                     and colorful / count <= .03) else WEBP_QUALITY
 
 
-def prerender_pages(path: Path, pages: range, directory: Path) -> set[int]:
-    """Render a short uniform-DPI range; fall back to individual pages on failure."""
-    if len(pages) < 2:
-        return set()
-    dpis = {_page_render_dpi(path, page) for page in pages}
-    if len(dpis) != 1:
-        return set()
-    prefix = directory / "render-batch"
-    try:
-        _run(["pdftocairo", "-png", "-r", str(dpis.pop()), "-f", str(pages.start),
-              "-l", str(pages.stop - 1), str(path), str(prefix)],
-             timeout=COMMAND_TIMEOUT * len(pages))
-        staged = list(directory.glob("render-batch-*.png"))
-        produced = {int(image.stem.rsplit("-", 1)[1]): image for image in staged}
-        if set(produced) != set(pages) or len(staged) != len(pages):
-            raise RuntimeError("incomplete batch render")
-        for page, image in produced.items():
-            image.replace(directory / f"page-{page:06d}.png")
-        return set(pages)
-    except (RuntimeError, OSError, ValueError):
-        for page in pages:
-            (directory / f"page-{page:06d}.png").unlink(missing_ok=True)
-        return set()
-    finally:
-        for image in directory.glob("render-batch-*.png"):
-            image.unlink(missing_ok=True)
-
-
 def render_page(path: Path, page: int, directory: Path,
                 reader_pixels: tuple[int, int] | None = None, reader_jxl: bool = False,
-                *, prepared: bool = False) -> tuple[Path, int, int]:
+                reader_images: bool = True) -> tuple[Path, int, int]:
     prefix = directory / f"page-{page:06d}"
-    if not prepared:
-        _run([
-            "pdftocairo", "-png", "-singlefile", "-r", str(_page_render_dpi(path, page)),
-            "-f", str(page), "-l", str(page), str(path), str(prefix),
-        ], timeout=COMMAND_TIMEOUT)
+    _run([
+        "pdftocairo", "-png", "-singlefile", "-r", str(_page_render_dpi(path, page)),
+        "-f", str(page), "-l", str(page), str(path), str(prefix),
+    ], timeout=COMMAND_TIMEOUT)
     png = prefix.with_suffix(".png")
     if not png.is_file():
         raise RuntimeError(f"page {page} render missing")
     from PIL import Image
-    # pdftocairo output is produced locally from the checked-out PDF. Pillow's
-    # decompression-bomb guard can reject a legitimate oversized page before
-    # this function gets a chance to enforce the pipeline's lower pixel cap.
-    previous_max_pixels = Image.MAX_IMAGE_PIXELS
-    Image.MAX_IMAGE_PIXELS = None
-    try:
-        image_context = Image.open(png)
-    finally:
-        Image.MAX_IMAGE_PIXELS = previous_max_pixels
-    with image_context as image:
+    with Image.open(png) as image:
         width, height = image.size
         rgb = image.convert("RGB")
         if width * height > MAX_PAGE_PIXELS:
@@ -589,6 +619,9 @@ def render_page(path: Path, page: int, directory: Path,
             rgb = rgb.resize((max(1, round(width * scale)), max(1, round(height * scale))))
             width, height = rgb.size
             rgb.save(png, "PNG")
+        if not reader_images:
+            rgb.close()
+            return png, width, height
         if reader_pixels is None and not reader_jxl:
             # Preserve the older single-stage profile's delivery bytes.
             if WEBP_MAX_DIMENSION and max(width, height) > WEBP_MAX_DIMENSION:
@@ -668,14 +701,14 @@ def write_json(path: Path, payload: dict) -> tuple[str, int]:
 
 def read_bucket_json(path: str) -> dict:
     from huggingface_hub import HfFileSystem
-    uri = f"hf://buckets/vomebook/pdf-pages/{path}"
+    uri = f"hf://buckets/{shared.PDF_PAGES_BUCKET}/{path}"
     with HfFileSystem(token=os.environ.get("HF_TOKEN")).open(uri, "rb") as stream:
         return json.loads(stream.read())
 
 
 def read_bucket_gzip_json(path: str) -> dict:
     from huggingface_hub import HfFileSystem
-    uri = f"hf://buckets/vomebook/pdf-pages/{path}"
+    uri = f"hf://buckets/{shared.PDF_PAGES_BUCKET}/{path}"
     with HfFileSystem(token=os.environ.get("HF_TOKEN")).open(uri, "rb") as stream:
         return json.loads(gzip.decompress(stream.read()))
 
@@ -697,6 +730,9 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
             "status": "skipped", "reason": "native-text-pdf", "profile": asset_profile(),
             "classification": probe["classification"], "page_count": pages, "stream": False,
         }
+    presentation = item.get("reader_presentation") or reader_presentation(source)
+    if presentation["strategy"] == "preserve-pdf":
+        raise ValueError("preserved PDFs require the independent plan-render/plan-ocr pipeline; reader re-encoding is disabled")
     previous = item.get("_previous_ocr") if isinstance(item.get("_previous_ocr"), dict) else None
     previous_manifest = None
     previous_book = None
@@ -743,7 +779,7 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
                 page_entry = dict(old_page)
                 if probe["classification"] != "native-text":
                     if not JXL_ENABLED:
-                        for field in ("j", "js", "jb"):
+                        for field in ("j", "jbucket", "js", "jb"):
                             page_entry.pop(field, None)
                     elif reencode_jxl:
                         with tempfile.TemporaryDirectory(dir=temp) as page_temp:
@@ -751,6 +787,7 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
                             jxl_path = bundle / root / "pages" / f"page-{page:06d}.jxl"
                             jxl_sha, jxl_bytes = encode_jxl(rendered, jxl_path)
                             page_entry.update({"j": (root / "pages" / jxl_path.name).as_posix(),
+                                                "jbucket": shared.PDF_OCR_INPUT_BUCKET,
                                                "js": jxl_sha, "jb": jxl_bytes})
                 page_results.append(page_entry)
                 continue
@@ -804,10 +841,12 @@ def build_item(item: dict, source: Path, bundle: Path) -> dict:
                     jxl_path = bundle / root / "pages" / f"page-{page:06d}.jxl"
                     jxl_sha, jxl_bytes = encode_jxl(rendered, jxl_path)
                     page_entry.update({"j": (root / "pages" / jxl_path.name).as_posix(),
+                                       "jbucket": shared.PDF_OCR_INPUT_BUCKET,
                                        "js": jxl_sha, "jb": jxl_bytes})
             if input_png_path:
                 input_sha, input_bytes = shared.hash_file(input_png_path)
                 page_entry.update({"i": (root / "ocr-input" / input_png_path.name).as_posix(),
+                                   "ibucket": shared.PDF_OCR_INPUT_BUCKET,
                                    "is": input_sha, "ib": input_bytes})
             page_results.append(page_entry)
             for suffix in (".png", ".webp"):
@@ -916,17 +955,15 @@ def validate_manifest(manifest: dict) -> dict:
 
 
 def source_records(search_data: Path, revisions: Path, assets_manifest: dict | None = None,
-                   repo: str = "", range_manifest: dict | None = None) -> list[dict]:
+                   repo: str = "") -> list[dict]:
     records = pdf_assets.load_records(search_data, revisions, repo, "pdf")
+    original_sizes = {item["key"]: item.get("source_bytes") for item in records}
     if assets_manifest:
         generated = pdf_assets.load_generated_records(
             assets_manifest, repo=repo, assets_revision=str(assets_manifest.get("revision", "main")),
             min_bytes=0,
         )
         for item in generated:
-            # Structure-optimized PDFs are delivery artifacts in a separate
-            # Bucket. OCR the ordinary Reader-Assets PDF instead of downloading
-            # or reprocessing the range artifact.
             records.append(item)
     # A repaired/generated Reader PDF is authoritative for OCR. In particular,
     # never extract text from the original GBK-encoded 林一章版 PDF when its
@@ -940,16 +977,11 @@ def source_records(search_data: Path, revisions: Path, assets_manifest: dict | N
     for item in records:
         key = item["key"]
         if key not in by_key or item.get("source_kind") == "generated":
+            if item.get("source_kind") == "generated" and key in original_sizes:
+                item = {**item, "original_source_bytes": original_sizes[key]}
             by_key[key] = item
     records = list(by_key.values())
     records.sort(key=lambda item: (item.get("repo", ""), item.get("path", ""), item.get("source_kind", "")))
-    range_files = (range_manifest or {}).get("files", {})
-    for item in records:
-        range_entry = range_files.get(item["key"], {})
-        if isinstance(range_entry, dict) and range_entry.get("status") == "failed":
-            item["range_status"] = "failed"
-            item["range_reason"] = str(range_entry.get("reason") or "structure optimization failed")[:1000]
-            item["force_image_render"] = True
     return records
 
 

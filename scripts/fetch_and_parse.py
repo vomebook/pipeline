@@ -16,6 +16,7 @@ import time
 import gzip
 import urllib.parse
 import posixpath
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -71,6 +72,8 @@ BROWSER_KEY_MAP = {
 }
 
 SEARCH_DATA_VERSION = 2
+TRANSIENT_HTTP_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+HTTP_RETRY_DELAYS = (1, 2, 4)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -86,34 +89,46 @@ def _make_request(url: str, token: str) -> urllib.request.Request:
     return req
 
 
-def http_get_json(url: str, token: str = "") -> dict | list:
-    """GET JSON 端点，遇 429 自动重试，带指数退避。"""
-    for attempt in range(3):
+def _retry_delay(attempt: int) -> int:
+    return HTTP_RETRY_DELAYS[min(attempt, len(HTTP_RETRY_DELAYS) - 1)]
+
+
+def _open_with_retries(req: urllib.request.Request, timeout: int):
+    """Open an HF request, retrying only errors that may resolve by themselves."""
+    for attempt in range(len(HTTP_RETRY_DELAYS) + 1):
         try:
-            with urllib.request.urlopen(_make_request(url, token), timeout=30) as resp:
-                body = resp.read().decode("utf-8")
-                return json.loads(body)
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                wait = 2 ** attempt
-                print(f"  ⏳ 频率限制 (429)，等待 {wait}s 后重试...")
-                time.sleep(wait)
-                continue
-            print(f"  ⚠ HTTP {e.code}: {url}")
-            return {}
-        except Exception as e:
-            print(f"  ⚠ HTTP GET JSON 失败 [{url}]: {e}")
-            return {}
-    return {}
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            if error.code not in TRANSIENT_HTTP_CODES or attempt >= len(HTTP_RETRY_DELAYS):
+                raise
+            delay = _retry_delay(attempt)
+            print(f"  ⚠ HTTP {error.code}，{delay}s 后重试 ({attempt + 1}/{len(HTTP_RETRY_DELAYS)})...")
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+            if attempt >= len(HTTP_RETRY_DELAYS):
+                raise
+            delay = _retry_delay(attempt)
+            print(f"  ⚠ 网络请求失败 [{error}]，{delay}s 后重试 ({attempt + 1}/{len(HTTP_RETRY_DELAYS)})...")
+            time.sleep(delay)
+
+
+def http_get_json(url: str, token: str = "") -> dict | list:
+    """GET JSON, retrying transient HF/API failures before returning empty data."""
+    try:
+        with _open_with_retries(_make_request(url, token), timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as error:
+        print(f"  ⚠ HTTP GET JSON 失败 [{url}]: {error}")
+        return {}
 
 
 def http_get_text(url: str, token: str = "") -> str:
-    """GET 文本端点，成功返回字符串，失败返回空字符串。"""
+    """GET text, retrying transient HF/API failures before returning empty text."""
     try:
-        with urllib.request.urlopen(_make_request(url, token), timeout=30) as resp:
+        with _open_with_retries(_make_request(url, token), timeout=30) as resp:
             return resp.read().decode("utf-8")
-    except Exception as e:
-        print(f"  ⚠ HTTP GET TEXT 失败 [{url}]: {e}")
+    except Exception as error:
+        print(f"  ⚠ HTTP GET TEXT 失败 [{url}]: {error}")
         return ""
 
 
@@ -259,7 +274,7 @@ def batch_get_sizes(repo: str, revision: str, paths: list[str], token: str, max_
             req.add_header("Authorization", f"Bearer {token}")
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with _open_with_retries(req, timeout=60) as resp:
                 results = json.loads(resp.read().decode("utf-8"))
                 for item in results:
                     p = item.get("path", "")
@@ -268,6 +283,14 @@ def batch_get_sizes(repo: str, revision: str, paths: list[str], token: str, max_
                         size_map[p] = s
         except Exception as e:
             print(f"  ⚠ paths-info 失败 (batch {batch_num}, {len(batch)}条): {e}")
+            # A single malformed/unsupported path can make the whole request
+            # return 400. Split the batch so valid siblings still get sizes.
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                size_map.update(batch_get_sizes(repo, revision, batch[:midpoint], token,
+                                                max_bytes=max(1000, max_bytes // 2)))
+                size_map.update(batch_get_sizes(repo, revision, batch[midpoint:], token,
+                                                max_bytes=max(1000, max_bytes // 2)))
 
         if idx < total:
             time.sleep(0.3)
@@ -348,12 +371,32 @@ def parse_one_line(line: str, repo: str, size_map: dict) -> dict | None:
 def get_repo_sha(repo: str, token: str) -> str:
     """
     通过 HF API 获取仓库最新 commit SHA。
+
+    HF API 被限流时，解析默认分支目录文件的响应头。该响应由同一
+    revision 提供，仍然能保证后续目录下载使用已确认的 commit。
     返回空字符串表示获取失败。
     """
     url = f"{API_DATASETS}/{repo}"
     data = http_get_json(url, token)
     if isinstance(data, dict):
-        return data.get("sha", "")
+        sha = data.get("sha", "")
+        if sha:
+            return sha
+
+    fallback_url = (
+        f"{RAW_BASE}/{repo}/resolve/main/"
+        f"{urllib.parse.quote('直接目录.txt')}"
+    )
+    request = _make_request(fallback_url, token)
+    request.method = "HEAD"
+    try:
+        with _open_with_retries(request, timeout=30) as response:
+            sha = response.headers.get("X-Repo-Commit", "")
+            if sha:
+                print(f"  ↪ API 限流，使用目录响应头确认版本: {sha[:8]}")
+                return sha
+    except Exception as error:
+        print(f"  ⚠ 目录响应头也无法确认版本 [{error}]")
     return ""
 
 

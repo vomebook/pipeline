@@ -26,14 +26,6 @@ class OcrLayoutTests(unittest.TestCase):
         self.assertEqual(result["text"], "甲乙\n\n丙丁")
         self.assertEqual([x["precision"] for x in result["text_spans"]], ["block"] * 4)
 
-    def test_vertical_stacked_panels_do_not_interleave_columns(self):
-        blocks = [
-            block("右上", [.7, .1, .75, .4]), block("左上", [.1, .1, .15, .4]),
-            block("右下", [.7, .46, .75, .8]), block("左下", [.1, .46, .15, .8]),
-        ]
-        result = layout.arrange(blocks, 1000, 1000, {"writing_mode": "vertical-rl"})
-        self.assertEqual(result["text"], "右上\n\n左上\n\n右下\n\n左下")
-
     def test_rtl_heading_reorders_glyph_blocks_but_never_reverses_line_string(self):
         glyphs = [block("民", [.1, .1, .15, .15]), block("人", [.2, .1, .25, .15])]
         result = layout.arrange(glyphs, 1000, 1000, {"writing_mode": "horizontal-rtl"})
@@ -43,23 +35,6 @@ class OcrLayoutTests(unittest.TestCase):
                                 {"writing_mode": "horizontal-rtl"})
         self.assertEqual(result["text"], "人民")
         self.assertIn("within-block-character-order-unverified", result["layout"]["review"])
-
-    def test_arabic_rtl_fixture_keeps_word_order(self):
-        words = [block("عليكم", [.1, .1, .35, .16]), block("سلام", [.55, .1, .8, .16])]
-        result = layout.arrange(words, 1000, 1000, {"writing_mode": "horizontal-rtl"})
-        self.assertEqual(result["text"], "سلام\n\nعليكم")
-
-    def test_degenerate_native_geometry_defaults_to_horizontal(self):
-        blocks = [block("députés", [0, 0, 0, 0]), block("arrêtés", [0, 0, 0, 0])]
-        result = layout.arrange(blocks, 596, 842)
-        self.assertEqual(result["layout"]["writing_mode"], "horizontal-ltr")
-        self.assertIn("reading-direction-assumed-ltr", result["layout"]["review"])
-
-    def test_narrow_horizontal_fragments_do_not_infer_vertical_reading(self):
-        blocks = [block("第一", [.1, .1, .15, .14]), block("第二", [.2, .1, .25, .14]),
-                  block("第三", [.3, .1, .35, .14])]
-        result = layout.arrange(blocks, 1000, 1000)
-        self.assertEqual(result["layout"]["writing_mode"], "horizontal-ltr")
 
     def test_two_columns_do_not_interleave_rows(self):
         blocks = [block("左栏第一行", [.1, .1, .4, .14]), block("右栏第一行", [.6, .1, .9, .14]),

@@ -11,16 +11,24 @@ from huggingface_hub.errors import RepositoryNotFoundError
 
 try:
     from .reader_assets import (
-        EPUB_CHAPTER_PROFILE, MANIFEST_NAME, READER_ASSETS_REPO, asset_key, canonical_json, decode_search_payload,
+        EPUB_CHAPTER_PROFILE, MANIFEST_NAME, READER_ASSETS_BUCKET, READER_ASSETS_REPO,
+        asset_key, bucket_conversion_contract, canonical_json,
+        conversion_dependencies, decode_search_payload,
         empty_manifest, load_json, needs_epub_chapters, relative_path, reusable_object_key,
         source_conversion_contract, source_url, validate_manifest,
     )
+    from .reader_bucket import INDEX_FILES, read_json as read_bucket_json
+    from .reader_gc_graph import S3BucketStore
 except ImportError:
     from reader_assets import (
-        EPUB_CHAPTER_PROFILE, MANIFEST_NAME, READER_ASSETS_REPO, asset_key, canonical_json, decode_search_payload,
+        EPUB_CHAPTER_PROFILE, MANIFEST_NAME, READER_ASSETS_BUCKET, READER_ASSETS_REPO,
+        asset_key, bucket_conversion_contract, canonical_json,
+        conversion_dependencies, decode_search_payload,
         empty_manifest, load_json, needs_epub_chapters, relative_path, reusable_object_key,
         source_conversion_contract, source_url, validate_manifest,
     )
+    from reader_bucket import INDEX_FILES, read_json as read_bucket_json
+    from reader_gc_graph import S3BucketStore
 
 try:
     from . import shared
@@ -29,6 +37,11 @@ except ImportError:
 
 
 def remote_manifest(api: HfApi, repo_id: str) -> dict:
+    if type(api).__name__ == "HfApi":
+        try:
+            return validate_manifest(read_bucket_json(INDEX_FILES["manifest"], os.environ.get("HF_TOKEN")))
+        except (FileNotFoundError, OSError, ValueError) as error:
+            raise RuntimeError("Reader bucket manifest is unavailable; refusing to scan against a stale dataset manifest") from error
     try:
         if not api.file_exists(repo_id=repo_id, repo_type="dataset", filename=MANIFEST_NAME):
             return empty_manifest()
@@ -42,8 +55,38 @@ def shard_for_key(key: str, shard_count: int) -> int:
     return shared.hash_for_key(key, shard_count)
 
 
+def bucket_paths_to_check(records, manifest, *, repo="", extension="", exact_path="") -> set[str]:
+    """Collect existing mappings that would otherwise be skipped as ready."""
+    paths = set()
+    files = manifest.get("files", {})
+    extension = extension.lower().lstrip(".")
+    for record in records:
+        source_repo = str(record.get("Repo") or "")
+        ext = str(record.get("Extension") or "").lower().lstrip(".")
+        if (repo and source_repo != repo) or (extension and ext != extension):
+            continue
+        path = relative_path(record)
+        if exact_path and path != exact_path:
+            continue
+        if ext in {"htm", "html"} and any(
+                part.lower() == ".files" or part.lower().endswith(".files") or part.lower().endswith("_files")
+                for part in path.split("/")):
+            continue
+        if bucket_conversion_contract(source_repo, path, ext, int(record.get("Size") or 0)) is None:
+            continue
+        existing = files.get(asset_key(source_repo, path), {})
+        if (existing.get("status") != "ready" or existing.get("bucket") != READER_ASSETS_BUCKET):
+            continue
+        if isinstance(existing.get("path"), str):
+            paths.add(existing["path"])
+        if isinstance(existing.get("chapter_manifest"), str):
+            paths.add(existing["chapter_manifest"])
+    return paths
+
+
 def build_queue(records, revisions, manifest, *, repo="", extension="", exact_path="", limit=0,
-                  retry_failed=False, force=False, shard_count=1, shard_index=0) -> list[dict]:
+                  retry_failed=False, force=False, bucket_migrate=False,
+                  bucket_objects=None, shard_count=1, shard_index=0) -> list[dict]:
     if shard_count < 1 or not 0 <= shard_index < shard_count:
         raise ValueError("invalid reader asset shard")
     selected = []
@@ -54,12 +97,19 @@ def build_queue(records, revisions, manifest, *, repo="", extension="", exact_pa
         ext = str(record.get("Extension") or "").lower().lstrip(".")
         if (repo and source_repo != repo) or (extension and ext != extension):
             continue
+        # PDF page/OCR assets have a separate page-stream publisher. The
+        # generic static migration must never republish a PDF as a dataset
+        # document and call that a bucket migration.
+        if bucket_migrate and ext == "pdf":
+            continue
         path = relative_path(record)
         if ext in {"htm", "html"} and any(
                 part.lower() == ".files" or part.lower().endswith(".files") or part.lower().endswith("_files")
                 for part in path.split("/")):
             continue
-        contract = source_conversion_contract(source_repo, path, ext, int(record.get("Size") or 0))
+        contract = (bucket_conversion_contract(source_repo, path, ext, int(record.get("Size") or 0))
+                    if bucket_migrate else
+                    source_conversion_contract(source_repo, path, ext, int(record.get("Size") or 0)))
         if contract is None:
             continue
         revision = str(revisions.get(source_repo) or "")
@@ -71,14 +121,32 @@ def build_queue(records, revisions, manifest, *, repo="", extension="", exact_pa
         if shard_for_key(key, shard_count) != shard_index:
             continue
         profile, reader_mode, output_name = contract
+        spreadsheet_pages = output_name == "page-manifest.json"
         existing = files.get(key, {})
+        chapter_path = existing.get("chapter_manifest") if isinstance(existing, dict) else None
+        chapter_bucket_path_missing_prefix = (
+            existing.get("chapter_bucket") == READER_ASSETS_BUCKET
+            and isinstance(chapter_path, str)
+            and not chapter_path.startswith("ebook-chapters/")
+        )
+        object_present = (bucket_objects is None or existing.get("path") in bucket_objects)
+        chapter_manifest_present = (
+            not existing.get("chapter_manifest") or bucket_objects is None
+            or existing.get("chapter_manifest") in bucket_objects
+        )
+        if (bucket_migrate and not force and existing.get("status") == "ready"
+                and existing.get("bucket") == READER_ASSETS_BUCKET
+                and existing.get("profile") == profile
+                and object_present and chapter_manifest_present
+                and not chapter_bucket_path_missing_prefix):
+            continue
         manual = str(existing.get("profile") or "").startswith("manual-")
         if not force and existing.get("status") == "ready" and manual:
             continue
         # Source revisions are repository-wide. A new commit does not mean this
         # particular file changed, and the metadata feed has no file digest.
         # Reuse a ready artifact unless an explicit rebuild was requested.
-        if not force and existing.get("status") == "ready" and existing.get("profile") == profile:
+        if not bucket_migrate and not force and existing.get("status") == "ready" and existing.get("profile") == profile:
             retryable_update = (
                 retry_failed and existing.get("failed_source_revision") == revision
                 and existing.get("failed_profile") == profile
@@ -93,31 +161,40 @@ def build_queue(records, revisions, manifest, *, repo="", extension="", exact_pa
             )
             if not retryable_update and not missing_chapters:
                 continue
-        if not force and existing.get("status") == "failed" and existing.get("profile") == profile and not retry_failed:
+        if (bucket_migrate and contract[1] == "pdf" and not spreadsheet_pages
+                and not force and existing.get("status") == "ready"
+                and existing.get("profile") == profile
+                and existing.get("bucket") in {None, ""}):
+            continue
+        if not bucket_migrate and not force and existing.get("status") == "failed" and existing.get("profile") == profile and not retry_failed:
             continue
         failed_current = (existing.get("failed_source_revision") == revision
                           and existing.get("failed_profile") == profile)
-        if not force and failed_current and not retry_failed:
+        if not bucket_migrate and not force and failed_current and not retry_failed:
             continue
         item = {
             "key": key, "repo": source_repo, "path": path, "extension": ext,
             "source_revision": revision, "source_bytes": record.get("Size") or 0,
             "source_url": source_url(source_repo, revision, path), "profile": profile,
             "reader_mode": reader_mode, "output_name": output_name,
+            "conversion_dependencies": conversion_dependencies(ext, reader_mode),
         }
         selected.append(item)
     priority = {"pdf": 9, "tif": 0, "tiff": 0, "epub": 1, "mobi": 1, "azw3": 1, "fb2": 1, "odt": 1, "rtf": 1, "chm": 1, "djvu": 2,
-                 "doc": 3, "docx": 3, "htm": 3, "html": 3, "caj": 3, "kdh": 3,
+                  "doc": 3, "docx": 3, "htm": 3, "html": 3, "txt": 3, "md": 3, "markdown": 3,
+                   "jpg": 3, "jpeg": 3, "png": 3, "bmp": 3, "webp": 3,
+                   "vcf": 3, "ini": 3, "caj": 3, "kdh": 3,
                  "ppt": 3, "pptx": 3, "pps": 3, "odp": 3, "xls": 3, "xlsx": 3, "csv": 3, "ods": 3, "wps": 3,
                  "mht": 3, "mhtml": 3, "ps": 3,
-                 "ape": 3, "wma": 3, "amr": 3,
-                 "flv": 4, "f4v": 4, "rm": 4, "rmvb": 4, "mkv": 4, "avi": 4,
-                 "mpg": 4, "mpeg": 4, "mts": 4, "ts": 4, "wmv": 4}
+                  "ape": 3, "wma": 3, "amr": 3, "asx": 4,
+                  "mp3": 3, "wav": 3, "m4a": 3, "flac": 3, "mpga": 3,
+                  "flv": 4, "f4v": 4, "rm": 4, "rmvb": 4, "mkv": 4, "avi": 4,
+                  "mpg": 4, "mpeg": 4, "mts": 4, "ts": 4, "wmv": 4, "mp4": 4, "mov": 4, "swf": 4}
     selected.sort(key=lambda item: (priority[item["extension"]], item["repo"], item["path"]))
     return selected[:limit] if limit > 0 else selected
 
 
-def active_keys(records) -> list[str]:
+def active_keys(records, *, bucket_migrate=False) -> list[str]:
     keys = []
     for record in records:
         repo = str(record.get("Repo") or "")
@@ -127,7 +204,10 @@ def active_keys(records) -> list[str]:
                 part.lower() == ".files" or part.lower().endswith(".files") or part.lower().endswith("_files")
                 for part in path.split("/")):
             continue
-        if source_conversion_contract(repo, path, extension, int(record.get("Size") or 0)) is not None:
+        contract = (bucket_conversion_contract(repo, path, extension, int(record.get("Size") or 0))
+                    if bucket_migrate else
+                    source_conversion_contract(repo, path, extension, int(record.get("Size") or 0)))
+        if contract is not None:
             keys.append(asset_key(repo, path))
     return sorted(set(keys))
 
@@ -167,6 +247,9 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--bucket-migrate", action="store_true")
+    parser.add_argument("--clean-rebuild", action="store_true",
+                        help="rebuild the complete non-PDF snapshot and publish it authoritatively")
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--manifest", type=Path)
@@ -178,6 +261,8 @@ def main() -> int:
     args = parse_args()
     if args.limit < 0:
         raise ValueError("limit must be non-negative")
+    if args.clean_rebuild and (args.repo or args.extension or args.path):
+        raise ValueError("clean rebuild cannot be combined with a scoped filter")
     if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
         raise ValueError("invalid reader asset shard")
     records = decode_search_payload(load_json(args.search_data))
@@ -186,19 +271,36 @@ def main() -> int:
         manifest = validate_manifest(load_json(args.manifest))
     else:
         manifest = remote_manifest(HfApi(token=os.environ.get("HF_TOKEN") or None), args.assets_repo)
+    bucket_objects = None
+    if args.bucket_migrate:
+        # Verify only current mappings; listing millions of unrelated bucket objects is wasteful.
+        paths = bucket_paths_to_check(records, manifest, repo=args.repo,
+                                      extension=args.extension, exact_path=args.path)
+        store = S3BucketStore()
+        bucket_objects = store.existing_files(READER_ASSETS_BUCKET, paths)
+        manifest_references = store.manifest_references(READER_ASSETS_BUCKET, bucket_objects)
+        dependencies = set().union(*manifest_references.values()) if manifest_references else set()
+        present_dependencies = store.existing_files(READER_ASSETS_BUCKET, dependencies)
+        for manifest_path, required in manifest_references.items():
+            if not required.issubset(present_dependencies):
+                bucket_objects.discard(manifest_path)
     queue = build_queue(records, revisions, manifest, repo=args.repo, extension=args.extension, exact_path=args.path,
-                        limit=args.limit, retry_failed=args.retry_failed, force=args.force,
-                        shard_count=args.shard_count, shard_index=args.shard_index)
+                        limit=args.limit, retry_failed=args.retry_failed,
+                        force=args.force or args.clean_rebuild,
+                        bucket_migrate=args.bucket_migrate,
+                         bucket_objects=bucket_objects,
+                         shard_count=args.shard_count, shard_index=args.shard_index)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    current_keys = active_keys(records)
+    current_keys = active_keys(records, bucket_migrate=args.bucket_migrate)
     args.output.write_bytes(canonical_json({
         "version": 1,
         "items": queue,
         "active_keys": current_keys,
         "stale_keys": sorted(set(manifest.get("files", {})) - set(current_keys)),
         "objects": reusable_objects(manifest),
-        "force_rebuild": bool(args.force),
-        "authoritative_snapshot": not bool(args.repo or args.extension or args.path),
+        "force_rebuild": bool(args.force or args.clean_rebuild),
+        "authoritative_snapshot": bool(args.clean_rebuild) or not bool(args.repo or args.extension or args.path or args.bucket_migrate),
+        "bucket_migration": bool(args.bucket_migrate),
     }, pretty=True))
     print(f"queued {len(queue)} reader asset conversion(s)")
     return 0

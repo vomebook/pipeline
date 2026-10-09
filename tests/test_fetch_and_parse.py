@@ -5,8 +5,10 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +40,45 @@ class FetchAndParseTests(unittest.TestCase):
     def test_write_action_output_is_optional_outside_actions(self):
         with patch.dict(os.environ, {}, clear=True):
             self.module.write_action_output("data_changed", "true")
+
+    def test_json_request_retries_transient_http_errors(self):
+        response = Mock()
+        response.__enter__ = lambda value: value
+        response.__exit__ = lambda *args: None
+        response.read.return_value = b'{"sha": "captured"}'
+        error = urllib.error.HTTPError("https://example.test", 503, "busy", {}, None)
+
+        with patch.object(urllib.request, "urlopen", side_effect=[error, response]), \
+             patch.object(self.module.time, "sleep") as sleep:
+            result = self.module.http_get_json("https://example.test")
+
+        self.assertEqual(result, {"sha": "captured"})
+        sleep.assert_called_once_with(1)
+
+    def test_text_request_retries_transient_network_errors(self):
+        response = Mock()
+        response.__enter__ = lambda value: value
+        response.__exit__ = lambda *args: None
+        response.read.return_value = "目录\n".encode("utf-8")
+
+        with patch.object(urllib.request, "urlopen", side_effect=[urllib.error.URLError("temporary"), response]), \
+             patch.object(self.module.time, "sleep") as sleep:
+            result = self.module.http_get_text("https://example.test")
+
+        self.assertEqual(result, "目录\n")
+        sleep.assert_called_once_with(1)
+
+    def test_repo_sha_falls_back_to_catalog_revision_header(self):
+        response = Mock()
+        response.__enter__ = lambda value: value
+        response.__exit__ = lambda *args: None
+        response.headers = {"X-Repo-Commit": "fallback-sha"}
+
+        with patch.object(self.module, "http_get_json", return_value={}), \
+             patch.object(urllib.request, "urlopen", return_value=response):
+            result = self.module.get_repo_sha("VoiceOfML/VOMEBOOK", "token")
+
+        self.assertEqual(result, "fallback-sha")
 
     def test_main_reports_unchanged_without_generating_output(self):
         with tempfile.TemporaryDirectory() as temporary:

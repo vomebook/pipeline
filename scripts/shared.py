@@ -2,13 +2,17 @@
 """Shared file hashing, hash sharding, and Hugging Face retry helpers."""
 
 import hashlib
+import os
+import random
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
 CHUNK_BYTES = 1024 * 1024
-PDF_PAGES_BUCKET = "vomebook/pdf-pages"
-PDF_RANGE_BUCKET = "vomebook/pdf-optimized"
+PDF_PAGES_BUCKET = "vomebook/pdf-pages-v2"
+PDF_OCR_INPUT_BUCKET = os.environ.get("PDF_OCR_INPUT_BUCKET", "melsm/pdf-archive-v2")
+READER_ASSETS_BUCKET = "vomebook/reader-assets-v2"
 
 T = TypeVar("T")
 
@@ -60,23 +64,81 @@ def hf_retry_delay(attempt: int, cap: int = 60, max_shift: int = 5) -> int:
     return min(cap, 2 ** min(attempt, max_shift))
 
 
-def pdf_pages_sidecar_entry(path: str) -> dict:
+def batch_bucket_files_with_retry(bucket: str, additions: list[tuple[str, str]], token: str | None,
+                                  *, max_attempts: int = 8) -> None:
+    """Upload a bucket batch with bounded retry for HF/Xet throttling."""
+    from huggingface_hub import batch_bucket_files
+
+    for attempt in range(max_attempts):
+        try:
+            batch_bucket_files(bucket, add=additions, token=token)
+            return
+        except Exception as error:
+            response = getattr(error, "response", None)
+            status = getattr(response, "status_code", None)
+            text = str(error).lower()
+            retryable = (
+                status in {408, 425, 429, 500, 502, 503, 504}
+                or "too many requests" in text
+                or "xet-write-token" in text
+                or "timeout" in text
+                or isinstance(error, (ConnectionError, TimeoutError))
+            )
+            if not retryable or attempt + 1 == max_attempts:
+                raise
+            delay = min(300, hf_retry_delay(attempt, cap=120) + random.uniform(0, 3))
+            print(f"transient HF bucket upload error ({status or type(error).__name__}); "
+                  f"retrying in {delay:.1f}s (attempt {attempt + 1}/{max_attempts})", flush=True)
+            time.sleep(delay)
+
+
+def pdf_pages_sidecar_entry(path: str, result: dict | None = None, current: dict | None = None) -> dict:
     """Compact search-sidecar entry for a published PDF page stream."""
-    return {"s": 2, "m": "p", "p": path, "b": PDF_PAGES_BUCKET}
+    entry = {"s": 2, "m": "p", "p": path, "b": PDF_PAGES_BUCKET}
+    document = (result or {}).get("reader_assets_path", "")
+    bucket = (result or {}).get("reader_assets_bucket", "")
+    if not document and current:
+        if str(current.get("p", "")).endswith("/document.pdf"):
+            document, bucket = current["p"], current.get("b", "")
+        else:
+            document, bucket = current.get("pd", ""), current.get("pdb", "")
+    if document.endswith("/document.pdf") and bucket in {PDF_PAGES_BUCKET, READER_ASSETS_BUCKET}:
+        entry.update(pd=document, pdb=bucket)
+    return entry
+
+
+def preserve_pdf_sidecar_entry(current: dict | None, result: dict) -> dict:
+    entry = dict(current or {})
+    if (result.get("status") != "ready"
+            or result.get("reader_presentation", {}).get("strategy") != "preserve-pdf"
+            or not str(entry.get("p", "")).endswith("/page-manifest.json")):
+        return entry
+    if result.get("source_kind") == "generated" and result.get("reader_assets_path"):
+        entry.update({"s": 2, "m": "p", "p": result["reader_assets_path"],
+                      "b": result.get("reader_assets_bucket") or PDF_PAGES_BUCKET})
+        if entry.get("o"):
+            entry["ob"] = PDF_PAGES_BUCKET
+        return entry
+    if entry.get("o"):
+        return {"s": 3, "m": "p", "o": entry["o"], "b": PDF_PAGES_BUCKET,
+                **({"om": entry["om"]} if entry.get("om") else {})}
+    return {"s": 4}
 
 
 def merge_pdf_ocr_sidecar_entry(current: dict | None, result: dict) -> dict | None:
     """Merge OCR metadata without losing an existing Reader asset mapping."""
-    entry = dict(current or {})
+    entry = preserve_pdf_sidecar_entry(current, result)
     if result.get("status") == "failed":
         return entry or {"s": 4, "om": "failed", "oe": result.get("error", "OCR failed")}
     if result.get("status") == "ready":
         page_manifest = result.get("page_manifest")
+        if result.get("reader_presentation", {}).get("strategy") == "preserve-pdf" and page_manifest:
+            raise ValueError("preserved PDF must not advertise a reader page stream")
         # A completed page stream must take precedence over an older optimized
         # PDF route.  OCR recognition can publish after rendering, so keeping
         # the PDF in `p` would make Reader ignore the already available pages.
         if (isinstance(page_manifest, dict) and isinstance(page_manifest.get("path"), str)):
-            entry.update(pdf_pages_sidecar_entry(page_manifest["path"]))
+            entry.update(pdf_pages_sidecar_entry(page_manifest["path"], result, entry))
         entry.update({
             "o": result["ocr_manifest"],
             "om": result.get("classification", ""),

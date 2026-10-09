@@ -14,52 +14,48 @@ import json
 import math
 import os
 import shutil
+import signal
+import subprocess
+import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+import uuid
 from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from huggingface_hub import HfApi, CommitOperationAdd, batch_bucket_files
+from huggingface_hub import HfApi, CommitOperationAdd
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.utils import get_session, hf_raise_for_status
 
 try:
-    from . import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout, pdf_ocr_progress
+    from . import pdf_ocr, pdf_assets, lin_pdf_text, pdf_render_schedule, pdf_worker_lanes, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout, reader_lifecycle
     from .run_pdf_ocr import source_path, _bucket_retry_delay
+    from .reader_bucket import index_path, publish_bytes, publish_json, publish_catalog, read_json as read_bucket_json
 except ImportError:
-    import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout, pdf_ocr_progress
+    import pdf_ocr, pdf_assets, lin_pdf_text, plan_pdf_ocr, publish_pdf_ocr_assets as publication, shared, ocr_layout, reader_lifecycle
+    import pdf_render_schedule
+    import pdf_worker_lanes
     from run_pdf_ocr import source_path, _bucket_retry_delay
+    from reader_bucket import index_path, publish_bytes, publish_json, publish_catalog, read_json as read_bucket_json
 
 RENDER_REGISTRY = "pdf_render_manifest.json"
 PROGRESS_REGISTRY = "pdf_ocr_progress.json"
 RENDER_PROGRESS_REGISTRY = "pdf_render_progress.json"
 RENDER_RANGE_PAGES = 250
 RENDER_RANGE_THRESHOLD = 500
-PDF_PAGES_BUCKET = "vomebook/pdf-pages"
-PNG_ARCHIVE_BUCKET = os.environ.get("PDF_PNG_ARCHIVE_BUCKET", "melsm/pdf-archive")
-JXL_ARCHIVE_BUCKET = os.environ.get("PDF_JXL_ARCHIVE_BUCKET", "melsm/pdf-jxl")
-BUCKET_UPLOAD_BATCH_SIZE = 500
+BUCKET = f"hf://buckets/{shared.PDF_PAGES_BUCKET}"
+OCR_INPUT_BUCKET = f"hf://buckets/{shared.PDF_OCR_INPUT_BUCKET}"
 SMALL_RENDER_MAX_SOURCE_BYTES = 100 * 1024 * 1024
-RENDER_BAND_BYTES = (16 * 1024 * 1024, 32 * 1024 * 1024,
-                     64 * 1024 * 1024, SMALL_RENDER_MAX_SOURCE_BYTES)
-OCR_LANE_COUNT = 4
-VERIFIED_SCAN_GBK_PDFS = frozenset(
-    "VoiceOfML/Teachers\0A1 马克思&恩格斯/01-04 马克思恩格斯全集 林一章新版/" + name + ".pdf"
-    for name in (
-        "专题分类索引（1-39）", "人名索引（1-39）", "名目索引（1-39）",
-        "注释选编（1-39）", "目录、说明、索引（40-50）", "说明汇编（1-39）",
-    )
-)
+RENDER_SAMPLE_TIMEOUT = 60
 
 
 def render_profile() -> str:
     return (f"pdf-render-v2-text-png-dpi-{pdf_ocr.OCR_DPI}-maxpix-{pdf_ocr.MAX_PAGE_PIXELS}"
             f"-webp-{pdf_ocr.WEBP_QUALITY}-{pdf_ocr.WEBP_MAX_DIMENSION}"
             f"-native-{pdf_ocr.MIN_NATIVE_PAGE_CHARS}-jxl-{int(pdf_ocr.JXL_ENABLED)}"
-            f"-{pdf_ocr.JXL_DISTANCE:g}-{pdf_ocr.JXL_EFFORT}-reader-source-pixels-v2-clean-webp-80-native-stream-v1")
+            f"-{pdf_ocr.JXL_DISTANCE:g}-{pdf_ocr.JXL_EFFORT}-reader-source-pixels-v2-clean-webp-80-native-stream-v1-preserve-bitonal-v1")
 
 
 def root_for(source_sha: str, key: str, identity: str) -> Path:
@@ -78,62 +74,80 @@ def public_item(item: dict) -> dict:
 
 
 def retry(operation):
-    # HF API rate windows can outlive the normal transfer retry budget.
     for attempt in range(15):
         try:
             return operation()
         except HfHubHTTPError as exc:
-            if shared.hf_status_code(exc) not in {408, 429, 499, 500, 502, 503, 504} or attempt == 14:
+            if shared.hf_status_code(exc) not in {408, 429, 500, 502, 503, 504} or attempt == 14:
                 raise
             delay = _bucket_retry_delay(exc, attempt)
         except (httpx.TransportError, ConnectionError, OSError):
             if attempt == 14:
                 raise
-            delay = min(900, 5 * 2 ** attempt)
+            delay = min(600, 5 * 2 ** min(attempt, 7))
         print(f"temporary object transfer failure; retry in {delay}s", flush=True)
         time.sleep(delay)
 
 
-def upload_bucket_objects(bundle: Path, bucket: str, paths: list[str], token: str | None) -> None:
-    """Upload known object paths without recursively listing the destination bucket."""
-    for start in range(0, len(paths), BUCKET_UPLOAD_BATCH_SIZE):
-        batch = paths[start:start + BUCKET_UPLOAD_BATCH_SIZE]
-        additions = [(str(bundle / path), path) for path in batch]
-        retry(lambda: batch_bucket_files(bucket, add=additions, token=token))
+def upload_objects(bundle: Path) -> list[str]:
+    """Sync only one book's immutable prefix, never recursively list the whole bucket."""
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
+    protection_paths = []
+    for root in sorted((bundle / "objects").glob("*/*/*")):
+        if root.is_dir():
+            relative = root.relative_to(bundle).as_posix()
+            resources = [{"bucket": shared.PDF_PAGES_BUCKET, "root": relative}]
+            if (root / "ocr-input").is_dir() or any((root / "pages").glob("*.jxl")):
+                resources.append({"bucket": shared.PDF_OCR_INPUT_BUCKET, "root": relative})
+            record = reader_lifecycle.processing_record(resources, "pdf-object-upload", {
+                "repository": os.environ.get("GITHUB_REPOSITORY", "local"),
+                "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+                "attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+            })
+            protection_path = index_path(f"processing/{uuid.uuid4().hex}.json")
+            retry(lambda: publish_json(protection_path, record, os.environ.get("HF_TOKEN")))
+            protection_paths.append(protection_path)
+            retry(lambda: api.sync_bucket(
+                str(root), f"{BUCKET}/{relative}",
+                include=["pages/*.webp", "ocr/**", "page-manifest.json", "render-manifest.json",
+                         "render-range-*.json"], quiet=True))
+            retry(lambda: api.sync_bucket(
+                str(root), f"{OCR_INPUT_BUCKET}/{relative}",
+                 include=["ocr-input/**", "pages/*.jxl"], quiet=True,
+                 token=os.environ.get("HF_INPUT_TOKEN") or os.environ.get("HF_TOKEN")))
+            record.update(status="uploaded", updated_at=reader_lifecycle.now_iso())
+            retry(lambda: publish_json(protection_path, record, os.environ.get("HF_TOKEN")))
+    return protection_paths
 
 
-def upload_objects(bundle: Path) -> None:
-    """Upload one shard's known objects without scanning any destination bucket."""
-    archive_token = os.environ.get("ARCHIVE_HF_TOKEN")
-    production, png, jxl = [], [], []
-    objects = bundle / "objects"
-    if not objects.is_dir():
+def release_processing_roots(paths: list[str], generation: str, result: dict) -> None:
+    for path in paths:
+        if not path.startswith("reader-index/processing/"):
+            raise ValueError("invalid processing root path")
+        record = read_bucket_json(path, os.environ.get("HF_TOKEN"))
+        reader_lifecycle.validate_processing_handoff(record, result)
+        released = reader_lifecycle.release_processing(record, generation)
+        publish_json(path, released, os.environ.get("HF_TOKEN"))
+
+
+def handoff_worker_results(api, repo: str, results: list[dict]) -> None:
+    """Progress registries take ownership before worker upload roots are released."""
+    if type(api) is not HfApi:
         return
-    for path in objects.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(bundle).as_posix()
-        if relative.startswith("objects/") and "/ocr-input/" in relative and relative.endswith(".png"):
-            png.append(relative)
-        elif relative.startswith("objects/") and "/pages/" in relative and relative.endswith(".jxl"):
-            jxl.append(relative)
-        else:
-            production.append(relative)
-    if production:
-        upload_bucket_objects(bundle, PDF_PAGES_BUCKET, sorted(production),
-                              os.environ.get("HF_TOKEN"))
-    if (png or jxl) and not archive_token:
-        raise RuntimeError("ARCHIVE_HF_TOKEN is required for PNG/JXL publication")
-    if png:
-        upload_bucket_objects(bundle, PNG_ARCHIVE_BUCKET, sorted(png), archive_token)
-    if jxl:
-        upload_bucket_objects(bundle, JXL_ARCHIVE_BUCKET, sorted(jxl), archive_token)
+    protected = [result for result in results if result.get("processing_roots")]
+    if not protected:
+        return
+    token = os.environ.get("HF_TOKEN")
+    generation = publish_catalog(publication.load_sidecar(api, repo), token)
+    for result in protected:
+        release_processing_roots(result["processing_roots"], generation, result)
 
 
 def read_object(meta: dict, suffix: str | None = None) -> bytes:
     path = pdf_ocr.validate_ocr_object_path(meta["path"], suffix)
-    bucket = (os.environ.get("PDF_OCR_INPUT_BUCKET", "vomebook/pdf-pages")
-              if "/ocr-input/" in path and path.endswith(".png") else "vomebook/pdf-pages")
+    bucket = meta.get("bucket") or (
+        shared.PDF_OCR_INPUT_BUCKET if "/ocr-input/" in path or path.endswith(".jxl")
+        else shared.PDF_PAGES_BUCKET)
     def download():
         # Public object resolve avoids per-page bucket_info/paths-info API calls.
         response = get_session().get(
@@ -141,16 +155,15 @@ def read_object(meta: dict, suffix: str | None = None) -> bytes:
             follow_redirects=True, timeout=120)
         hf_raise_for_status(response)
         return response.content
-    def download_verified():
-        data = download()
-        if len(data) != meta["bytes"] or hashlib.sha256(data).hexdigest() != meta["sha256"]:
-            raise ValueError(f"object checksum mismatch: {path}")
-        return data
-    return retry(download_verified)
+    data = retry(download)
+    if len(data) != meta["bytes"] or hashlib.sha256(data).hexdigest() != meta["sha256"]:
+        raise ValueError(f"object checksum mismatch: {path}")
+    return data
 
 
 def page_meta(page: dict, field: str) -> dict:
-    return {"path": page[field], "sha256": page[field + "s"], "bytes": page[field + "b"]}
+    return {"path": page[field], "sha256": page[field + "s"], "bytes": page[field + "b"],
+            **({"bucket": page[field + "bucket"]} if page.get(field + "bucket") else {})}
 
 
 def set_page_meta(page: dict, field: str, meta: dict) -> None:
@@ -158,6 +171,14 @@ def set_page_meta(page: dict, field: str, meta: dict) -> None:
 
 
 def load_registry(api, repo, name, revision=None):
+    if type(api) is HfApi:
+        try:
+            data = read_bucket_json(index_path(name), os.environ.get("HF_TOKEN"))
+        except FileNotFoundError:
+            return {"version": 1, "files": {}}
+        if data.get("version") != 1 or not isinstance(data.get("files"), dict):
+            raise ValueError(f"invalid {name}")
+        return data
     try:
         path = retry(lambda: api.hf_hub_download(repo_id=repo, repo_type="dataset", filename=name,
                                                 revision=revision))
@@ -171,8 +192,79 @@ def load_registry(api, repo, name, revision=None):
     return data
 
 
+def load_pdf_sources(api, repo: str) -> dict:
+    """Merge current-bucket PDF categories and derivatives into the source inventory."""
+    assets = load_registry(api, repo, "manifest.json")
+    if type(api) is not HfApi:
+        return assets
+    files = dict(assets["files"])
+    for bucket, path in [
+            *[(shared.READER_ASSETS_BUCKET, f"documents/pdf/{ext}/index.json")
+              for ext in ("ppt", "pptx", "pps", "wps", "ps")],
+            (shared.PDF_PAGES_BUCKET, "reader-index/derived_pdf_manifest.json")]:
+        try:
+            payload = read_bucket_json(path, os.environ.get("HF_TOKEN"), bucket=bucket)
+        except FileNotFoundError:
+            continue
+        entries = payload.get("files")
+        if not isinstance(entries, list):
+            raise ValueError(f"invalid PDF source index: {bucket}:{path}")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("key"), str):
+                raise ValueError(f"invalid PDF source entry: {bucket}:{path}")
+            object_path = entry.get("new_path") or entry.get("object") or entry.get("path")
+            size = entry.get("derived_bytes", entry.get("bytes"))
+            if (not isinstance(object_path, str) or not object_path.endswith("/document.pdf")
+                    or type(size) is not int or size < 1):
+                raise ValueError(f"invalid PDF source object: {bucket}:{path}")
+            files[entry["key"]] = {**entry, "status": "ready", "reader_mode": "pdf",
+                                    "path": object_path, "bytes": size, "bucket": bucket}
+    return {**assets, "files": files}
+
+
 def save_registry(api, repo, name, updates, merge=None, publish_streams=False):
     if not updates:
+        return
+    if type(api) is HfApi:
+        data = load_registry(api, repo, name)
+        for key, value in updates.items():
+            data["files"][key] = merge(data["files"].get(key), value) if merge else value
+        publish_json(index_path(name), data, os.environ.get("HF_TOKEN"))
+        if publish_streams:
+            ocr_state = load_registry(api, repo, publication.OCR_MANIFEST_NAME)
+            sidecar = publication.load_sidecar(api, repo)
+            for key, value in updates.items():
+                if value.get("status") != "ready":
+                    continue
+                previous = ocr_state["files"].get(key, {})
+                if previous.get("status") != "ready":
+                    ocr_state["files"][key] = {**value, "status": "rendered"}
+                elif (pdf_ocr.preserves_reader_pdf(value) and same_source(previous, value)
+                      and previous.get("source_sha256") == value.get("source_sha256")):
+                    ocr_state["files"][key] = {**previous, "page_manifest": None, "stream": False,
+                                              "render_manifest": value["render_manifest"],
+                                              "render_profile": value["render_profile"], "image_rendered": False,
+                                              "reader_presentation": value["reader_presentation"]}
+                elif (value.get("range_status") == "failed" and value.get("classification") == "native-text"
+                      and value.get("page_manifest") and same_source(previous, value)
+                      and previous.get("source_sha256") == value.get("source_sha256")):
+                    ocr_state["files"][key] = {**previous, "page_manifest": value["page_manifest"],
+                                                "render_manifest": value["render_manifest"],
+                                                "range_status": "failed", "classification": "native-text"}
+                entry = shared.preserve_pdf_sidecar_entry(sidecar["f"].get(key), value)
+                if value.get("page_manifest"):
+                    entry.update(shared.pdf_pages_sidecar_entry(value["page_manifest"]["path"], value, entry))
+                if entry:
+                    sidecar["f"][key] = entry
+            token = os.environ.get("HF_TOKEN")
+            publish_json(index_path(publication.OCR_MANIFEST_NAME), ocr_state, token)
+            publish_bytes(index_path(publication.SIDECAR_NAME), publication.encode_sidecar(sidecar), token)
+            if token:
+                generation = publish_catalog(sidecar, token)
+                for value in updates.values():
+                    paths = value.get("processing_roots", [])
+                    if paths:
+                        release_processing_roots(paths, generation, value)
         return
     for attempt in range(20):
         info = retry(lambda: api.repo_info(repo_id=repo, repo_type="dataset"))
@@ -198,20 +290,23 @@ def save_registry(api, repo, name, updates, merge=None, publish_streams=False):
                 if value.get("status") == "ready":
                     previous = ocr_state["files"].get(key, {})
                     if previous.get("status") != "ready":
-                        # Keep failed OCR books retryable after a render repair.
-                        # The refreshed render metadata is valid, but OCR still
-                        # has to rebuild the book before it can become ready.
-                        status = "failed" if previous.get("status") == "failed" else "rendered"
-                        ocr_state["files"][key] = {**value, "status": status}
-                    elif (value.get("page_manifest") and same_source(previous, value)
+                        ocr_state["files"][key] = {**value, "status": "rendered"}
+                    elif (pdf_ocr.preserves_reader_pdf(value) and same_source(previous, value)
+                          and previous.get("source_sha256") == value.get("source_sha256")):
+                        ocr_state["files"][key] = {**previous, "page_manifest": None, "stream": False,
+                                                  "render_manifest": value["render_manifest"],
+                                                  "render_profile": value["render_profile"], "image_rendered": False,
+                                                  "reader_presentation": value["reader_presentation"]}
+                    elif (value.get("range_status") == "failed" and value.get("classification") == "native-text"
+                          and value.get("page_manifest") and same_source(previous, value)
                           and previous.get("source_sha256") == value.get("source_sha256")):
                         ocr_state["files"][key] = {**previous, "page_manifest": value["page_manifest"],
-                                                    "render_manifest": value["render_manifest"],
-                                                    "range_status": value.get("range_status"),
-                                                    "classification": value["classification"]}
-                    entry = dict(sidecar["f"].get(key) or {})
+                                                   "render_manifest": value["render_manifest"],
+                                                   "range_status": "failed", "classification": "native-text"}
+                    entry = shared.preserve_pdf_sidecar_entry(sidecar["f"].get(key), value)
                     if value.get("page_manifest"):
-                        entry.update(shared.pdf_pages_sidecar_entry(value["page_manifest"]["path"]))
+                        entry.update(shared.pdf_pages_sidecar_entry(value["page_manifest"]["path"], value, entry))
+                    if entry:
                         sidecar["f"][key] = entry
             operations.append(CommitOperationAdd(path_in_repo=publication.SIDECAR_NAME,
                                                   path_or_fileobj=publication.encode_sidecar(sidecar)))
@@ -222,6 +317,12 @@ def save_registry(api, repo, name, updates, merge=None, publish_streams=False):
             api.create_commit(repo_id=repo, repo_type="dataset", parent_commit=info.sha,
                               commit_message=f"Publish {name}",
                               operations=operations)
+            token = os.environ.get("HF_TOKEN")
+            if token and type(api) is HfApi:
+                publish_json(index_path(name), data, token)
+                if publish_streams:
+                    publish_json(index_path(publication.OCR_MANIFEST_NAME), ocr_state, token)
+                    publish_bytes(index_path(publication.SIDECAR_NAME), publication.encode_sidecar(sidecar), token)
             return
         except HfHubHTTPError as exc:
             if not shared.is_retryable_hf_status(shared.hf_status_code(exc)) or attempt == 19:
@@ -240,48 +341,15 @@ def render_partition_matches(item, partition):
         return True
     size = int(item.get("source_bytes") or 0)
     if not size:
-        return partition in {"small", "under16", "under100"}
-    bands = {
-        "under16": (0, RENDER_BAND_BYTES[0]),
-        "16to32": (RENDER_BAND_BYTES[0], RENDER_BAND_BYTES[1]),
-        "32to64": (RENDER_BAND_BYTES[1], RENDER_BAND_BYTES[2]),
-        "64to100": (RENDER_BAND_BYTES[2], RENDER_BAND_BYTES[3]),
-    }
-    if partition in bands:
-        lower, upper = bands[partition]
-        return lower <= size < upper
-    if partition == "under100":
-        return size < SMALL_RENDER_MAX_SOURCE_BYTES
-    if partition == "small":
-        return size < SMALL_RENDER_MAX_SOURCE_BYTES
-    return size >= SMALL_RENDER_MAX_SOURCE_BYTES
+        return partition == "small"
+    is_small = size < SMALL_RENDER_MAX_SOURCE_BYTES
+    return is_small if partition == "small" else not is_small
 
 
-def filter_source_items(records, source_items):
-    if not source_items:
-        return records
-    if not isinstance(source_items, list) or any(
-            not isinstance(item, dict) or not isinstance(item.get("repo"), str)
-            or not isinstance(item.get("path"), str) for item in source_items):
-        raise ValueError("source items must be a list of repo/path objects")
-    selected = {(item["repo"], item["path"]) for item in source_items}
-    return [item for item in records if (item.get("repo"), item.get("path")) in selected]
-
-
-def ocr_lane_index(key, lane_count=OCR_LANE_COUNT):
-    if type(lane_count) is not int or lane_count < 1:
-        raise ValueError("OCR lane count must be a positive integer")
-    digest = hashlib.sha256(str(key).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") % lane_count
-
-
-def pending_render(records, rendered, ocr, retry_failed=False, partition="all", force_reprobe=False):
+def pending_render(records, rendered, ocr, retry_failed=False, partition="all"):
     pending = []
     for item in records:
-        if not force_reprobe and not render_partition_matches(item, partition):
-            continue
-        if force_reprobe:
-            pending.append(item)
+        if not render_partition_matches(item, partition):
             continue
         previous = rendered.get(item["key"])
         if same_source(previous, item) and previous.get("render_profile") == render_profile():
@@ -327,7 +395,8 @@ def validate_range(book, start, end, descriptor):
     pages = payload.get("pages")
     if not isinstance(pages, list) or [p.get("p") for p in pages] != list(range(start, end + 1)):
         raise ValueError("incomplete render range")
-    if (book.get("force_image_render") and book["probe"]["classification"] == "native-text"
+    if (book.get("force_image_render") and not pdf_ocr.preserves_reader_pdf(book)
+            and book["probe"]["classification"] == "native-text"
             and (not payload.get("image_rendered") or any("w" not in page for page in pages))):
         raise ValueError("native render range lacks required page images")
     validate_render({**book, "page_manifest": None}, {**book, "version": 1, "kind": "pdf-render",
@@ -338,59 +407,155 @@ def validate_range(book, start, end, descriptor):
     return pages
 
 
-def plan_render_ranges(queue, progress, force_reprobe=False):
+def estimate_render_cost(item, source, progress):
+    book = {**item, "render_profile": render_profile()}
+    previous = progress.get(book["key"], {})
+    image_rendered = (not pdf_ocr.preserves_reader_pdf(book)
+                      and bool(book.get("force_image_render") or book.get("probe", {}).get("classification") != "native-text"))
+    cost = pdf_render_schedule.history_cost(range_identity(book), previous, image_rendered)
+    if cost is not None:
+        return cost
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        queue = root / "book.json"
+        output = root / "cost"
+        pdf_ocr.write_json(queue, book)
+        command = [sys.executable, str(Path(__file__).resolve()), "measure-render", "--queue", str(queue),
+                   "--source", str(source.resolve()), "--output", str(output)]
+        with subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True) as process:
+            try:
+                process.wait(timeout=RENDER_SAMPLE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # Terminate Poppler children too; sampling never owns a production worker.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        result = output / "render-cost.json"
+        if result.is_file():
+            return json.loads(result.read_text(encoding="utf-8"))
+    return {"seconds_per_page": pdf_render_schedule.DEFAULT_PAGE_SECONDS,
+            "setup_seconds": 0, "source": "fallback", "samples": 0}
+
+
+def sample_render_cost(book, source, output=None):
+    count = book["page_count"]
+    samples = []
+    for number in sorted({1, (count + 1) // 2, count}):
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                result = render_book({**book, "start": number, "end": number}, source, Path(temp))
+                timing = result["timing"]
+                if (pdf_render_schedule.finite_seconds(timing.get("page_seconds"), positive=True) is not None
+                        and pdf_render_schedule.finite_seconds(timing.get("setup_seconds")) is not None):
+                    samples.append(timing)
+        except Exception as exc:
+            print(f"render timing sample unavailable: {type(exc).__name__}", flush=True)
+        cost = ({"seconds_per_page": max(s["page_seconds"] for s in samples),
+                 "setup_seconds": max(s["setup_seconds"] for s in samples),
+                 "source": "sample", "samples": len(samples)} if samples else {
+                     "seconds_per_page": pdf_render_schedule.DEFAULT_PAGE_SECONDS,
+                     "setup_seconds": 0, "source": "fallback", "samples": 0})
+        if output is not None:
+            pending = output / "render-cost.pending.json"
+            pdf_ocr.write_json(pending, cost)
+            os.replace(pending, output / "render-cost.json")
+    return cost
+
+
+def plan_render_ranges(queue, progress, target_seconds=None):
+    if target_seconds is not None and pdf_render_schedule.finite_seconds(target_seconds, positive=True) is None:
+        raise ValueError("render target seconds must be finite and positive")
     books = [{**item, "render_profile": render_profile()}
-             for shard in queue["shards"] for item in shard["records"]]
+              for shard in queue["shards"] for item in shard["records"]]
     tasks, saved = [], {}
     for book in books:
         prior = progress.get(book["key"], {})
-        existing = (prior.get("ranges", {}) if not force_reprobe
-                    and all(prior.get(k) == v for k, v in range_identity(book).items()) else {})
-        for start, end in render_ranges(book):
-            key = range_id(start, end)
-            descriptor = existing.get(key)
-            if descriptor:
-                try:
-                    validate_range(book, start, end, descriptor)
-                    saved.setdefault(book["key"], {})[key] = descriptor
-                    continue
-                except (ValueError, KeyError, TypeError, OSError, json.JSONDecodeError):
-                    pass
+        existing = prior.get("ranges", {}) if all(prior.get(k) == v for k, v in range_identity(book).items()) else {}
+        completed = []
+        for key, descriptor in existing.items():
+            bounds = pdf_render_schedule.parse_range(key, book["page_count"])
+            if bounds is None:
+                continue
+            start, end = bounds
+            try:
+                validate_range(book, start, end, descriptor)
+                saved.setdefault(book["key"], {})[key] = descriptor
+                completed.append(bounds)
+            except (ValueError, KeyError, TypeError, OSError, json.JSONDecodeError):
+                pass
+        size = RENDER_RANGE_PAGES if book["page_count"] > RENDER_RANGE_THRESHOLD else book["page_count"]
+        if target_seconds is not None:
+            size = pdf_render_schedule.range_size(book.get("_render_cost", {}), target_seconds, size)
+        for start, end in pdf_render_schedule.missing_ranges(book["page_count"], completed, size):
             tasks.append({**book, "start": start, "end": end})
-    count = min(256, len(tasks), max(1, math.ceil(sum(t["end"] - t["start"] + 1 for t in tasks) / 500)))
-    shards = shared.weighted_shards(tasks, count, weight=lambda t: t["end"] - t["start"] + 1,
-                                    order=lambda t: (-(t["end"] - t["start"] + 1), t["key"], t["start"])) if tasks else []
+    if target_seconds is None:
+        count = min(256, len(tasks), max(1, math.ceil(sum(t["end"] - t["start"] + 1 for t in tasks) / 500)))
+        shards = shared.weighted_shards(tasks, count, weight=lambda t: t["end"] - t["start"] + 1,
+                                        order=lambda t: (-(t["end"] - t["start"] + 1), t["key"], t["start"])) if tasks else []
+    else:
+        shards = pdf_render_schedule.balance(tasks, target_seconds)
     return {**queue, "books": books, "saved_ranges": saved,
-            "shard_count": len(shards), "shard_ids": list(range(len(shards))),
-            "shards": [{"index": i, "page_count": sum(t["end"] - t["start"] + 1 for t in shard),
-                        "records": shard} for i, shard in enumerate(shards)]}
+             **({"target_render_seconds": target_seconds} if target_seconds is not None else {}),
+             "shard_count": len(shards), "shard_ids": list(range(len(shards))),
+             "shards": [{"index": i, "page_count": sum(t["end"] - t["start"] + 1 for t in shard),
+                         **({"estimated_seconds": round(sum(map(pdf_render_schedule.task_seconds, shard)), 2)}
+                            if target_seconds is not None else {}),
+                         "records": ([{key: task[key] for key in (*range_identity(task), "start", "end")}
+                                      | {"_render_cost": task.get("_render_cost", {})} for task in shard]
+                                     if target_seconds is not None else shard)} for i, shard in enumerate(shards)]}
+
+
+def expand_render_tasks(queue, records):
+    books = {book["key"]: book for book in queue.get("books", [])}
+    tasks = []
+    for record in records:
+        book = books.get(record["key"])
+        if book is None:
+            raise ValueError("render task refers to an unknown book")
+        if any(record.get(key) != value for key, value in range_identity(book).items()):
+            raise ValueError("render task identity differs from book")
+        tasks.append({**book, **record})
+    return tasks
 
 
 def render_book(item: dict, source: Path, bundle: Path) -> dict:
+    started = time.perf_counter()
     source_sha, source_bytes = shared.hash_file(source)
     if item.get("source_sha256") and item["source_sha256"] != source_sha:
         raise ValueError("PDF source changed after planning")
     lin_native = lin_pdf_text.applies(item)
     probe = item.get("probe") or (lin_pdf_text.probe(source) if lin_native else pdf_ocr.probe_pdf(source))
+    presentation = item.get("reader_presentation") or pdf_ocr.reader_presentation(source)
+    preserve_pdf = pdf_ocr.preserves_reader_pdf({"reader_presentation": presentation})
     if "start" in item and not 1 <= item["start"] <= item["end"] <= probe["page_count"]:
         raise ValueError("invalid render page range")
     base = {**public_item(item), "source_sha256": source_sha, "source_bytes": source_bytes,
+            "reader_presentation": presentation,
             "render_profile": render_profile(), "profile": pdf_ocr.asset_profile(),
             "page_count": probe["page_count"], "classification": probe["classification"]}
     root = root_for(source_sha, item["key"], render_profile())
     bundle.mkdir(parents=True, exist_ok=True)
     pages = []
-    force_image_render = bool(item.get("force_image_render"))
+    force_image_render = bool(item.get("force_image_render")) and not preserve_pdf
     first, last = item.get("start", 1), item.get("end", probe["page_count"])
     scan_images = (pdf_ocr.scan_reader_images(source, first, last)
-                   if any(chars == 0 for chars in probe["page_chars"][first - 1:last])
+                   if not preserve_pdf and any(chars == 0 for chars in probe["page_chars"][first - 1:last])
                    else {})
+    native_text = {}
+    if not lin_native:
+        native_numbers = [number for number in range(first, last + 1)
+                          if probe["classification"] == "native-text"
+                          or probe["page_chars"][number - 1] >= pdf_ocr.MIN_NATIVE_PAGE_CHARS]
+        native_text = pdf_ocr.native_pages(source, native_numbers)
+    page_started = time.perf_counter()
     with tempfile.TemporaryDirectory(dir=bundle) as temp, (
-            lin_pdf_text.open_pdf(source) if lin_native else nullcontext(None)) as document:
-        prepared = set()
+            lin_pdf_text.pymupdf.open(source) if lin_native else nullcontext(None)) as document:
         for number in range(item.get("start", 1), item.get("end", probe["page_count"]) + 1):
             if probe["classification"] == "native-text" and not force_image_render:
-                text = lin_pdf_text.extract(document, number) if lin_native else pdf_ocr.native_page(source, number)
+                text = lin_pdf_text.extract(document, number) if lin_native else native_text[number]
                 payload = pdf_ocr.page_payload(number, text["width"], text["height"], text["blocks"], "native")
                 payload.update(ocr_layout.arrange(payload["blocks"], payload["width"], payload["height"], {}))
                 if not lin_native:
@@ -403,27 +568,27 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
                 set_page_meta(page, "o", metadata(out, bundle))
                 pages.append(page)
                 continue
-            if (number - first) % 4 == 0:
-                prepared = pdf_ocr.prerender_pages(source, range(number, min(number + 4, last + 1)), Path(temp))
             native = probe["classification"] == "native-text" or probe["page_chars"][number - 1] >= pdf_ocr.MIN_NATIVE_PAGE_CHARS
             reader_pixels = scan_images.get(number) if not native and probe["page_chars"][number - 1] == 0 else None
-            render_options = {"prepared": True} if number in prepared else {}
             png, width, height = pdf_ocr.render_page(source, number, Path(temp), reader_pixels,
-                                                     reader_jxl=pdf_ocr.JXL_ENABLED, **render_options)
+                                                     reader_jxl=pdf_ocr.JXL_ENABLED and not preserve_pdf,
+                                                     **({"reader_images": False} if preserve_pdf else {}))
             page = {"p": number, "source": "native" if native else "ocr", "width": width, "height": height}
             for field, local, folder in (("i", png, "ocr-input"),
-                                         ("w", png.with_suffix(".webp"), "pages")):
+                                          ("w", png.with_suffix(".webp"), "pages")):
+                if field == "w" and preserve_pdf:
+                    continue
                 destination = bundle / root / folder / local.name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(local), destination)
                 set_page_meta(page, field, metadata(destination, bundle))
-            if pdf_ocr.JXL_ENABLED:
+            if pdf_ocr.JXL_ENABLED and not preserve_pdf:
                 jxl = bundle / root / "pages" / f"page-{number:06d}.jxl"
                 reader_png = Path(temp) / f"page-{number:06d}-reader.png"
                 pdf_ocr.encode_jxl(reader_png if reader_png.is_file() else bundle / page["i"], jxl)
                 set_page_meta(page, "j", metadata(jxl, bundle))
             if native:
-                text = lin_pdf_text.extract(document, number) if lin_native else pdf_ocr.native_page(source, number)
+                text = lin_pdf_text.extract(document, number) if lin_native else native_text[number]
                 payload = pdf_ocr.page_payload(number, text["width"], text["height"], text["blocks"], "native")
                 payload.update(ocr_layout.arrange(payload["blocks"], payload["width"], payload["height"], {}))
                 if not lin_native:
@@ -435,6 +600,9 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
                              "text_spans": payload["text_spans"], "layout": payload["layout"]})
             pages.append(page)
             print(f"rendered {number}/{probe['page_count']}: {item['key']}", flush=True)
+    timing = {"page_count": len(pages), "image_rendered": any("w" in page for page in pages),
+              "page_seconds": time.perf_counter() - page_started,
+              "setup_seconds": page_started - started}
     if "start" in item:
         start, end = item["start"], item["end"]
         if not 1 <= start <= end <= probe["page_count"] or len(pages) != end - start + 1:
@@ -444,6 +612,7 @@ def render_book(item: dict, source: Path, bundle: Path) -> dict:
                                         "image_rendered": any("w" in page for page in pages),
                                         "start": start, "end": end, "pages": pages})
         return {**range_identity(base), "status": "range", "start": start, "end": end,
+                "timing": timing,
                 "descriptor": metadata(descriptor, bundle)}
     image_pages = [{"page": p["p"], **page_meta(p, "w")} for p in pages if "w" in p]
     page_manifest_meta = None
@@ -472,7 +641,10 @@ def validate_render(item, manifest, page_numbers=None):
     expected = list(page_numbers) if page_numbers is not None else list(range(1, item["page_count"] + 1))
     if len(pages) != len(expected) or [p["p"] for p in pages] != expected:
         raise ValueError("incomplete render page sequence")
-    if (item.get("force_image_render") and manifest.get("classification") == "native-text"
+    preserve_pdf = pdf_ocr.preserves_reader_pdf(item)
+    if preserve_pdf and (manifest.get("image_rendered") or manifest.get("page_manifest")):
+        raise ValueError("preserved PDF must not publish a reader image stream")
+    if (item.get("force_image_render") and not preserve_pdf and manifest.get("classification") == "native-text"
             and not manifest.get("image_rendered")):
         raise ValueError("native render lacks required page images")
     root = root_for(item["source_sha256"], item["key"], item["render_profile"])
@@ -480,6 +652,10 @@ def validate_render(item, manifest, page_numbers=None):
         if p.get("source") not in {"native", "ocr"} or p["width"] <= 0 or p["height"] <= 0:
             raise ValueError("invalid rendered page")
         for field, suffix in (("i", ".png"), ("w", ".webp"), ("j", ".jxl"), ("o", ".json.gz")):
+            if field in {"w", "j"} and preserve_pdf:
+                if field in p:
+                    raise ValueError("preserved PDF contains a recompressed reader image")
+                continue
             if field in {"i", "w"} and manifest["classification"] == "native-text" and not manifest.get("image_rendered"):
                 continue
             if field == "j" and manifest["classification"] == "native-text" and not manifest.get("image_rendered"):
@@ -503,16 +679,30 @@ def merge_render_ranges(old, new):
     ranges = dict(old.get("ranges", {})) if isinstance(old, dict) and all(
         old.get(key) == value for key, value in identity.items()) else {}
     ranges.update(new["ranges"])
-    return {**identity, "ranges": ranges}
+    timings = dict(old.get("range_timings", {})) if isinstance(old, dict) and all(
+        old.get(key) == value for key, value in identity.items()) and isinstance(old.get("range_timings", {}), dict) else {}
+    timings.update(new.get("range_timings", {}))
+    return {**identity, "ranges": ranges, **({"range_timings": timings} if timings else {})}
 
 
 def assemble_render_book(book, descriptors, bundle):
     pages = []
-    for start, end in render_ranges(book):
-        descriptor = descriptors.get(range_id(start, end))
-        if not descriptor:
+    ranges = []
+    for key, descriptor in descriptors.items():
+        bounds = pdf_render_schedule.parse_range(key, book["page_count"])
+        if bounds is None:
+            raise ValueError("invalid render range key")
+        ranges.append((*bounds, descriptor))
+    for start, end, descriptor in sorted(ranges, key=lambda item: (item[0], item[1])):
+        if start > len(pages) + 1:
             return None
-        pages.extend(validate_range(book, start, end, descriptor))
+        incoming = validate_range(book, start, end, descriptor)
+        overlap = min(len(incoming), max(0, len(pages) - start + 1))
+        if pages[start - 1:start - 1 + overlap] != incoming[:overlap]:
+            raise ValueError("conflicting overlapping render pages")
+        pages.extend(incoming[overlap:])
+    if len(pages) != book["page_count"]:
+        return None
     root = root_for(book["source_sha256"], book["key"], book["render_profile"])
     image_pages = [{"page": p["p"], **page_meta(p, "w")} for p in pages if "w" in p]
     page_manifest_meta = None
@@ -542,21 +732,6 @@ def recognition_identity(entry, options):
     language, backend = pdf_ocr.book_ocr_config(entry)
     base = pdf_ocr.asset_profile(language, backend)
     return f"{base}-layout-{ocr_layout.VERSION}-{digest}"
-
-
-def skip_ocr_for_generated_text_pdf(entry: dict) -> bool:
-    """Protect repaired native text, except the six verified scanned indexes.
-
-    Most GBK-repaired sources have usable text even when a runner reports a
-    scan. The six listed Teachers indexes have no substantive native text.
-    """
-    return (entry.get("source_kind") == "generated"
-            and "/gbk-font-repair-v1/" in str(entry.get("reader_assets_path", ""))
-            and not (entry.get("key") in VERIFIED_SCAN_GBK_PDFS
-                     and entry.get("classification") in {"scan", "mixed"}
-                     and isinstance(entry.get("ocr_pages"), int) and entry["ocr_pages"] > 0)
-            and not (entry.get("native_extractor") == "pymupdf-v1"
-                     and entry.get("classification") in {"native-text", "mixed"}))
 
 
 def generation_for(book):
@@ -615,46 +790,26 @@ def reuse_recognized_pages(old, entry, pages):
         return {}
 
 
-def ocr_manifest_is_available(old: dict, entry: dict) -> bool:
-    """Do not trust a ready sidecar after its immutable manifest disappears."""
-    try:
-        metadata = {"path": old["ocr_manifest"], "sha256": old["ocr_manifest_sha256"],
-                    "bytes": old["ocr_manifest_bytes"]}
-        manifest = json.loads(read_object(metadata, "/ocr-manifest.json"))
-        return (manifest.get("kind") == "pdf-ocr" and manifest.get("complete") is True
-                and manifest.get("source_sha256") == entry.get("source_sha256")
-                and manifest.get("profile") == old.get("profile")
-                and manifest.get("page_count") == entry.get("page_count"))
-    except (HfHubHTTPError, KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
-        return False
-
-
 def plan_images(rendered, current, progress, limit=20, target=500, overrides=None,
-                 retry_failed_only=False):
+                retry_failed_only=False):
     if limit < 1 or target < 1:
         raise ValueError("limit and target must be positive")
-    books, tasks, stale_render = [], [], []
+    books, tasks = [], []
     for key, entry in sorted(rendered.items(), key=lambda pair: (
             current.get(pair[0], {}).get("status") == "failed", pair[0])):
         if retry_failed_only and current.get(key, {}).get("status") != "failed":
             continue
         if entry.get("status") not in {"ready", "skipped"}:
             continue
-        if skip_ocr_for_generated_text_pdf(entry):
+        # Older page streams were classified as scans by Poppler even though
+        # their repaired GBK source contains Unicode text. Backfill them from
+        # the PDF; never send all of their pages to image recognition.
+        if lin_pdf_text.applies(entry) and entry.get("ocr_pages", 0) > 0:
             continue
         options = layout_options(overrides or {}, key)
         manifest = None
         if entry["status"] != "skipped":
-            try:
-                manifest = validate_render(
-                    entry, json.loads(read_object(entry["render_manifest"], "/render-manifest.json")))
-            except HfHubHTTPError as exc:
-                if shared.hf_status_code(exc) != 404:
-                    raise
-                stale_render.append({k: entry[k] for k in
-                                     ("key", "repo", "path", "source_bytes", "page_count", "source_kind")
-                                     if k in entry})
-                continue
+            manifest = validate_render(entry, json.loads(read_object(entry["render_manifest"], "/render-manifest.json")))
         native_text = "\n".join(str(page.get("text") or "") for page in (manifest or {}).get("pages", []))
         if pdf_ocr.OCR_LANG != "auto":
             language, _, backend = pdf_ocr.resolve_ocr_config(pdf_ocr.OCR_LANG, pdf_ocr.OCR_BACKEND)
@@ -666,45 +821,23 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                  "profile": recognition_identity({**entry, "ocr_language": language, "ocr_backend": backend}, options),
                  "layout_options": options}
         old = current.get(key, {})
-        stale_ocr_manifest = (old.get("status") == "ready" and bool(old.get("ocr_manifest"))
-                              and not ocr_manifest_is_available(old, entry))
         if (old.get("status") in {"ready", "skipped"} and same_source(old, entry)
                 and old.get("profile") == entry.get("profile")
                 and old.get("source_sha256") == entry.get("source_sha256")
                 and old.get("page_manifest") == entry.get("page_manifest")):
-            if not stale_ocr_manifest:
-                continue
-            print(f"stale OCR manifest; rebuilding {key}", flush=True)
+            continue
         if len(books) >= limit:
             break
         if entry["status"] == "skipped":
             books.append(entry)
             continue
-        books.append({**entry, "pages": manifest["pages"]})
-    if callable(progress):
-        progress = progress([book["key"] for book in books if book["status"] != "skipped"])
-    for book in books:
-        if book["status"] == "skipped":
-            continue
-        key = book["key"]
-        entry = book
-        old = current.get(key, {})
         generation = generation_for(entry)
         previous = progress.get(key, {})
-        if stale_ocr_manifest or old.get("status") == "failed":
-            # A missing or failed OCR result invalidates the saved page
-            # checkpoint too; otherwise a zero-page queue can republish the
-            # same dead path without recognizing anything.
-            saved = {}
-        elif retry_failed_only and old.get("status") == "failed":
-            # Failed books may contain progress pointing at a corrupted object.
-            # Rebuild all OCR pages so assemble_book cannot reuse it again.
-            saved = {}
-        else:
-            saved = previous.get("pages", {}) if previous.get("generation") == generation else reuse_recognized_pages(
-                old, entry, book["pages"])
-        book["saved"] = saved
-        pending = [p for p in book["pages"] if p["source"] == "ocr" and str(p["p"]) not in saved]
+        saved = previous.get("pages", {}) if previous.get("generation") == generation else reuse_recognized_pages(
+            old, entry, manifest["pages"])
+        book = {**entry, "pages": manifest["pages"], "saved": saved}
+        books.append(book)
+        pending = [p for p in manifest["pages"] if p["source"] == "ocr" and str(p["p"]) not in saved]
         # Fast ONNX recognition benefits from fewer model startups. Keep the
         # slower multilingual Paddle backend below a conservative task size so
         # one shard cannot approach the runner timeout.
@@ -712,7 +845,7 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
         for start in range(0, len(pending), task_target):
             tasks.append({"key": key, "generation": generation, "profile": entry["profile"],
                           "ocr_language": entry["ocr_language"], "ocr_backend": entry["ocr_backend"],
-                          "source_sha256": entry["source_sha256"], "layout_options": entry["layout_options"],
+                          "source_sha256": entry["source_sha256"], "layout_options": options,
                           "pages": pending[start:start + task_target]})
     # Pack small books together, while large books can span several workers.
     count = min(256, len(tasks), max(1, math.ceil(sum(len(t["pages"]) for t in tasks) / target)))
@@ -720,7 +853,6 @@ def plan_images(rendered, current, progress, limit=20, target=500, overrides=Non
                                    order=lambda t: (-len(t["pages"]), t["key"], t["pages"][0]["p"])) if tasks else []
     return {"version": 1, "kind": "pdf-image-ocr-queue", "language": pdf_ocr.OCR_LANG,
             "ocr_version": pdf_ocr.OCR_VERSION, "backend": pdf_ocr.OCR_BACKEND, "books": books,
-            "stale_render": stale_render,
             "target_pages_per_shard": target, "total_ocr_pages": sum(len(t["pages"]) for t in tasks),
             "shard_count": len(shards), "shard_ids": list(range(len(shards))), "shards": shards}
 
@@ -729,19 +861,11 @@ def recognize_task(task, bundle):
     root = root_for(task["source_sha256"], task["key"], task["generation"] + task["profile"])
     done, errors = [], []
     bundle.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=bundle) as temp, ThreadPoolExecutor(max_workers=1) as downloads:
+    with tempfile.TemporaryDirectory(dir=bundle) as temp:
         png = Path(temp) / "input.png"
-        def download(page):
-            return read_object(page_meta(page, "i"), ".png")
-        pages = task["pages"]
-        pending = downloads.submit(download, pages[0]) if pages else None
-        for index, page in enumerate(pages):
+        for page in task["pages"]:
             try:
-                try:
-                    data = pending.result()
-                finally:
-                    pending = downloads.submit(download, pages[index + 1]) if index + 1 < len(pages) else None
-                png.write_bytes(data)
+                png.write_bytes(read_object(page_meta(page, "i"), ".png"))
                 from PIL import Image
                 config = task.get("layout_options", {})
                 options = {**config.get("default", {}), **config.get("pages", {}).get(str(page["p"]), {})}
@@ -798,8 +922,7 @@ def collect_progress(queue, results):
                 raise ValueError("OCR result input mismatch")
             pdf_ocr.validate_ocr_object_path(page["o"], f"page-{page['p']:06d}.json.gz")
             key = str(page["p"])
-            if key in value["pages"] and any(value["pages"][key].get(field) != page.get(field)
-                                             for field in pdf_ocr_progress.COMPACT_FIELDS):
+            if key in value["pages"] and value["pages"][key] != page:
                 raise ValueError("conflicting OCR page results")
             value["pages"][key] = page
     return updates
@@ -809,9 +932,8 @@ def assemble_book(book, saved, bundle):
     base = {k: v for k, v in book.items() if k not in {"pages", "saved"}}
     if book["status"] == "skipped":
         return base
-    pages = [p if p["source"] == "native" else
-             {**p, **saved.get(str(p["p"]), {})} for p in book["pages"]]
-    if any(p is None or (p["source"] == "ocr" and "o" not in p) for p in pages):
+    pages = [p if p["source"] == "native" else saved.get(str(p["p"])) for p in book["pages"]]
+    if any(p is None for p in pages):
         return {**base, "status": "failed", "error": "OCR pages incomplete; uploaded pages retained for retry"}
     texts = []
     for page in pages:
@@ -902,17 +1024,19 @@ def publish_legacy_render(queue, results, api, repo):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=("plan-render", "render", "publish-render", "plan-ocr", "ocr", "publish-ocr"))
+    parser.add_argument("stage", choices=("plan-render", "measure-render", "render", "publish-render", "plan-ocr", "ocr", "publish-ocr"))
     parser.add_argument("--queue", type=Path, default=Path("output/pdf-ocr/queue.json"))
+    parser.add_argument("--source", type=Path)
     parser.add_argument("--output", type=Path, default=Path("output/pdf-ocr/bundle"))
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--checkpoint", type=int, default=0)
     parser.add_argument("--retry-failed", action="store_true")
-    parser.add_argument("--partition", choices=("all", "small", "under16", "16to32", "32to64", "64to100", "under100", "large"), default="all")
-    parser.add_argument("--ocr-lane-index", type=int)
-    parser.add_argument("--ocr-lane-count", type=int, default=OCR_LANE_COUNT)
+    parser.add_argument("--partition", choices=("all", "small", "large"), default="all")
+    parser.add_argument("--worker-lane", default="")
+    parser.add_argument("--worker-owner", default=os.environ.get("GITHUB_REPOSITORY_OWNER", ""))
     parser.add_argument("--native-text-stream", action="store_true")
+    parser.add_argument("--target-render-seconds", type=int)
     parser.add_argument("--retry-failed-only", action="store_true")
     parser.add_argument("--results", type=Path, nargs="*", default=[])
     parser.add_argument("--results-dir", type=Path)
@@ -920,52 +1044,56 @@ def main():
     parser.add_argument("--revisions", type=Path, default=Path("state/commits.json"))
     parser.add_argument("--layout-overrides", type=Path, default=Path("state/pdf_ocr_layout.json"))
     parser.add_argument("--assets-repo", default="vomebook/Reader-Assets")
-    parser.add_argument("--source-repo", default="")
-    parser.add_argument("--source-path-prefix", default="")
-    parser.add_argument("--source-items-json", default="[]")
-    parser.add_argument("--force-reprobe", action="store_true")
     args = parser.parse_args()
+    worker_config = None
+    if args.worker_lane:
+        if args.stage not in {"plan-render", "plan-ocr"} or args.partition != "all":
+            parser.error("--worker-lane requires a planning stage and --partition all")
+        worker_config = pdf_worker_lanes.load_config()
+        if pdf_worker_lanes.lane_for_owner(worker_config, args.worker_owner) != args.worker_lane:
+            parser.error("account cannot claim another PDF worker lane")
+    if args.target_render_seconds is not None and (args.target_render_seconds < 1 or args.stage != "plan-render"):
+        parser.error("--target-render-seconds requires plan-render and a positive value")
+    if args.stage == "measure-render":
+        if args.source is None:
+            parser.error("measure-render requires --source")
+        sample_render_cost(json.loads(args.queue.read_text(encoding="utf-8")), args.source, args.output)
+        return 0
     api = HfApi(token=os.environ.get("HF_TOKEN"))
     repo = args.assets_repo
     args.output.mkdir(parents=True, exist_ok=True)
     if args.stage.startswith("plan-"):
-        revision = retry(lambda: api.repo_info(repo_id=repo, repo_type="dataset")).sha
-        rendered = load_registry(api, repo, RENDER_REGISTRY, revision)["files"]
-        current = load_registry(api, repo, publication.OCR_MANIFEST_NAME, revision)["files"]
+        revision = "reader-assets-v2"
+        rendered = load_registry(api, repo, RENDER_REGISTRY)["files"]
+        current = load_registry(api, repo, publication.OCR_MANIFEST_NAME)["files"]
         if args.stage == "plan-render":
-            assets = load_registry(api, repo, "manifest.json", revision)
+            assets = load_pdf_sources(api, repo)
             assets["revision"] = revision
-            range_state = load_registry(api, repo, "pdf_range_manifest.json", revision)
-            records = pdf_ocr.source_records(args.search_data, args.revisions, assets,
-                                             repo=args.source_repo, range_manifest=range_state)
-            if args.source_path_prefix:
-                records = [item for item in records
-                           if str(item.get("path", "")).startswith(args.source_path_prefix)]
-            records = filter_source_items(records, json.loads(args.source_items_json))
-            records = pending_render(records, rendered, current, args.retry_failed, args.partition,
-                                     force_reprobe=args.force_reprobe)
+            records = pdf_ocr.source_records(args.search_data, args.revisions, assets)
+            if worker_config:
+                records = pdf_worker_lanes.select_records(worker_config, records, args.worker_lane, args.worker_owner)
+            records = pending_render(records, rendered, current, args.retry_failed, args.partition)
             selected = pdf_ocr.queue(records, args.limit, args.checkpoint)
-            queue = plan_pdf_ocr.plan(selected, native_text_stream=args.native_text_stream)
-            queue["kind"] = "pdf-render-queue"
             render_progress = load_registry(api, repo, RENDER_PROGRESS_REGISTRY, revision)["files"]
-            queue = plan_render_ranges(queue, render_progress, force_reprobe=args.force_reprobe)
+            estimator = (lambda item, source: estimate_render_cost(item, source, render_progress)) \
+                if args.target_render_seconds is not None else None
+            queue = plan_pdf_ocr.plan(selected, native_text_stream=args.native_text_stream,
+                                      render_estimator=estimator)
+            queue["kind"] = "pdf-render-queue"
+            queue = plan_render_ranges(queue, render_progress, args.target_render_seconds)
         else:
-            if args.source_repo:
-                rendered = {key: value for key, value in rendered.items()
-                            if value.get("repo") == args.source_repo}
-            if args.source_path_prefix:
-                rendered = {key: value for key, value in rendered.items()
-                            if str(value.get("path", "")).startswith(args.source_path_prefix)}
-            if args.ocr_lane_index is not None:
-                if not 0 <= args.ocr_lane_index < args.ocr_lane_count:
-                    parser.error("OCR lane index must be within the configured lane count")
-                rendered = {key: value for key, value in rendered.items()
-                            if ocr_lane_index(key, args.ocr_lane_count) == args.ocr_lane_index}
+            if worker_config:
+                rendered = {item["key"]: item for item in pdf_worker_lanes.select_records(
+                    worker_config, [{**entry, "key": key} for key, entry in rendered.items()],
+                    args.worker_lane, args.worker_owner)}
+            progress = load_registry(api, repo, PROGRESS_REGISTRY, revision)["files"]
             overrides = json.loads(args.layout_overrides.read_text(encoding="utf-8")) if args.layout_overrides.is_file() else {}
-            queue = plan_images(rendered, current,
-                                lambda keys: pdf_ocr_progress.load_progress(api, repo, keys, revision), args.limit,
-                                 plan_pdf_ocr.ocr_target_pages_per_shard(), overrides,
+            queue = plan_images(rendered, current, progress, args.limit,
+                                plan_pdf_ocr.ocr_target_pages_per_shard(), overrides,
                                  retry_failed_only=args.retry_failed_only)
+        if worker_config:
+            queue.update(worker_lane=args.worker_lane, worker_owner=args.worker_owner.lower(),
+                         worker_config=pdf_worker_lanes.config_identity(worker_config))
         args.queue.parent.mkdir(parents=True, exist_ok=True)
         pdf_ocr.write_json(args.queue, queue)
         print(f"{args.stage}: {queue['shard_count']} shards", flush=True)
@@ -978,10 +1106,11 @@ def main():
                 raise ValueError("planned workers but no result artifacts found; refusing empty publication")
             publish_legacy_render(queue, results, api, repo)
             return 0
-        planned = {(item["key"], item["start"], item["end"]): item
-                   for shard in queue["shards"] for item in shard["records"]}
+        planned = {(item["key"], item["start"], item["end"]): item for item in expand_render_tasks(
+            queue, [item for shard in queue["shards"] for item in shard["records"]])}
         books = {item["key"]: item for item in queue["books"]}
         completed_ranges = {key: dict(value) for key, value in queue.get("saved_ranges", {}).items()}
+        range_timings = {}
         for result in results:
             item = planned.get((result["key"], result.get("start"), result.get("end")))
             if not item or any(result.get(field) != value for field, value in range_identity(item).items()):
@@ -994,8 +1123,16 @@ def main():
                 if key in saved and saved[key] != result["descriptor"]:
                     raise ValueError("conflicting render range results")
                 saved[key] = result["descriptor"]
+                timing = result.get("timing", {})
+                if (isinstance(timing, dict) and timing.get("page_count") == end - start + 1
+                        and pdf_render_schedule.finite_seconds(timing.get("page_seconds"), positive=True) is not None
+                        and pdf_render_schedule.finite_seconds(timing.get("setup_seconds")) is not None):
+                    range_timings.setdefault(item["key"], {})[key] = timing
         updates = [{**range_identity(book), "ranges": completed_ranges[key]}
                    for key, book in books.items() if key in completed_ranges]
+        for update in updates:
+            if update["key"] in range_timings:
+                update["range_timings"] = range_timings[update["key"]]
         if updates:
             save_registry(api, repo, RENDER_PROGRESS_REGISTRY, {r["key"]: r for r in updates},
                           merge=merge_render_ranges)
@@ -1005,7 +1142,7 @@ def main():
                 try:
                     result = assemble_render_book(book, completed_ranges.get(book["key"], {}), Path(temp))
                     if result:
-                        upload_objects(Path(temp))
+                        result["processing_roots"] = upload_objects(Path(temp))
                         validate_render(result, json.loads(read_object(result["render_manifest"], "/render-manifest.json")))
                         if result.get("page_manifest"):
                             images = json.loads(read_object(result["page_manifest"], "/page-manifest.json"))
@@ -1016,6 +1153,7 @@ def main():
                 published.append(result or {**public_item(book), "status": "failed",
                                             "error": "render ranges incomplete; uploaded ranges retained for retry"})
         save_registry(api, repo, RENDER_REGISTRY, {r["key"]: r for r in published}, publish_streams=True)
+        handoff_worker_results(api, repo, [r for r in results if r.get("status") == "range"])
         print(f"render publication: {len(published)} results, "
               f"{sum(r.get('status') == 'ready' for r in published)} ready", flush=True)
         return 0
@@ -1026,76 +1164,54 @@ def main():
     if args.stage == "publish-ocr":
         results = read_results(result_paths(args.results, args.results_dir, bool(queue["shards"])))
         updates = collect_progress(queue, results)
-        pdf_ocr_progress.save_progress(api, repo, updates)
+        save_registry(api, repo, PROGRESS_REGISTRY, updates, merge_progress)
         completed = []
-        # Upload generated book manifests in bounded groups. One sync per book
-        # made large OCR batches spend most of publish time in transfer setup.
-        for offset in range(0, len(queue["books"]), 10):
-            batch = queue["books"][offset:offset + 10]
-            with tempfile.TemporaryDirectory(dir=args.output) as temp:
-                pending_uploads = []
-                for book in batch:
-                    try:
-                        saved = updates.get(book["key"], {}).get("pages", book.get("saved", {}))
-                        result = assemble_book(book, saved, Path(temp))
-                        if result["status"] == "ready":
-                            pending_uploads.append(result)
-                        completed.append(result)
-                    except Exception as exc:
-                        completed.append({**public_item({k: v for k, v in book.items() if k not in {"pages", "saved"}}),
-                                          "status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]})
-                if pending_uploads:
-                    upload_objects(Path(temp))
+        for book in queue["books"]:
+            try:
+                saved = updates.get(book["key"], {}).get("pages", book.get("saved", {}))
+                with tempfile.TemporaryDirectory(dir=args.output) as temp:
+                    result = assemble_book(book, saved, Path(temp))
+                    if result["status"] == "ready":
+                        result["processing_roots"] = upload_objects(Path(temp))
+                completed.append(result)
+            except Exception as exc:
+                completed.append({**public_item({k: v for k, v in book.items() if k not in {"pages", "saved"}}),
+                                  "status": "failed", "error": f"{type(exc).__name__}: {exc}"[:1000]})
         if completed:
             publication.publish(api, repo, completed)
+        handoff_worker_results(api, repo, results)
         print(f"published {len(completed)} books; incomplete books retain page progress", flush=True)
         return 0
     if not 0 <= args.shard < len(queue["shards"]):
         raise ValueError("invalid shard")
     tasks = queue["shards"][args.shard]
     if args.stage == "render":
-        tasks = tasks["records"]
+        tasks = expand_render_tasks(queue, tasks["records"]) if "books" in queue else tasks["records"]
     else:
         # Same worker/model, small durable checkpoints. A timeout near page 500
         # must not discard all of that worker's completed recognition.
         tasks = [{**task, "pages": task["pages"][start:start + 25]}
                  for task in tasks for start in range(0, len(task["pages"]), 25)]
     results = []
-    with tempfile.TemporaryDirectory(dir=args.output) as shard_temp:
-        bundle = Path(shard_temp)
-        for task in tasks:
-            try:
-                if args.stage == "render":
-                    result = render_book(task, source_path(task), bundle)
-                else:
-                    result = recognize_task(task, bundle)
-                results.append(result)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"[:1000]
-                if args.stage == "render":
-                    result = {**range_identity(task), "start": task["start"], "end": task["end"],
-                              "status": "failed", "error": error}
-                    root = root_for(task["source_sha256"], task["key"], task["render_profile"])
-                else:
-                    result = {"key": task["key"], "generation": task["generation"],
-                              "pages": [], "errors": [{"error": error}]}
-                    root = root_for(task["source_sha256"], task["key"],
-                                    task["generation"] + task["profile"])
-                shutil.rmtree(bundle / root, ignore_errors=True)
-                results.append(result)
+    for task in tasks:
         try:
-            upload_objects(bundle)
+            with tempfile.TemporaryDirectory(dir=args.output) as temp:
+                if args.stage == "render":
+                    result = render_book(task, source_path(task), Path(temp))
+                else:
+                    result = recognize_task(task, Path(temp))
+                result["processing_roots"] = upload_objects(Path(temp))
+            results.append(result)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"[:1000]
-            for index, result in enumerate(results):
-                if result.get("status") == "failed" or result.get("errors"):
-                    continue
-                if args.stage == "render":
-                    results[index] = {**result, "status": "failed", "error": error}
-                else:
-                    results[index] = {"key": result["key"], "generation": result["generation"],
-                                      "pages": [], "errors": [{"error": error}]}
-    pdf_ocr.write_json(args.output / f"results-{args.shard}.json", {"version": 1, "results": results})
+            if args.stage == "render":
+                result = {**range_identity(task), "start": task["start"], "end": task["end"],
+                          "status": "failed", "error": error}
+            else:
+                result = {"key": task["key"], "generation": task["generation"], "pages": [], "errors": [{"error": error}]}
+            results.append(result)
+        # Keep completed book/range metadata even if a later task times out.
+        pdf_ocr.write_json(args.output / f"results-{args.shard}.json", {"version": 1, "results": results})
     return int(any(r.get("status") == "failed" or r.get("errors") for r in results))
 
 
